@@ -1,0 +1,1 @@
+"""FFmpeg Installer package."""

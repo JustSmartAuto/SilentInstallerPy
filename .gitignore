@@ -1,0 +1,17 @@
+# 二进制产物与内嵌安装包（体积大，源码仓库不含）
+*.exe
+*.dll
+*.zip
+*.i64
+
+# 构建输出
+build/
+dist/
+__pycache__/
+*.pyc
+*.spec
+
+# 杂项
+rsync-win/
+obj/
+bin/
