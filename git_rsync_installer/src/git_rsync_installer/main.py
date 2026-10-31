@@ -53,9 +53,22 @@ def broadcast_env_change() -> None:
 
 
 def bundle_dir() -> Path:
+    """内嵌资源所在目录（PyInstaller 打包后为 _MEIPASS/assets，开发时为项目 assets/）。
+
+    依次尝试多个候选位置，找不到时返回最后的候选（由调用方报错）。
+    """
+    candidates = []
     if hasattr(sys, "_MEIPASS"):
-        return Path(sys._MEIPASS)
-    return Path(__file__).parent.parent.parent / "assets"
+        candidates.append(Path(sys._MEIPASS) / "assets")
+    candidates += [
+        Path(__file__).parent.parent.parent / "assets",
+        Path.cwd() / "assets",
+        Path(sys.argv[0]).parent / "assets",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[0]
 
 
 def find_git_exe() -> Path | None:
