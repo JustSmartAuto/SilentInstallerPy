@@ -267,6 +267,7 @@ class InstallerApp:
         self.root.configure(bg="white")
 
         self.is_installing = False
+        self.is_busy = False
         self.temp_dir = Path(tempfile.gettempdir()) / "mosquitto-installer"
 
         try:
