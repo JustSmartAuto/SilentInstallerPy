@@ -557,6 +557,58 @@ def force_wipe_home() -> bool:
         return not DB_HOME.exists()
 
 
+def describe_port_listener(port: int) -> tuple[str, str, str, str] | None:
+    """找出监听指定端口的进程，返回 (pid, 进程名, 可执行路径, 所属服务名)。查不到返回 None。"""
+    try:
+        r = subprocess.run(["netstat", "-ano"], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=30,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:
+        return None
+    pid = None
+    for line in (r.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[1].endswith(f":{port}") and \
+                parts[3].upper().startswith("LISTEN"):
+            pid = parts[4]
+            break
+    if not pid or not pid.isdigit():
+        return None
+    name = path = svc = ""
+    ps_script = (
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8;"
+        f"$p = Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\";"
+        "if ($p) { Write-Output (\"P|\" + $p.Name + \"|\" + $p.ExecutablePath); };"
+        f"$s = Get-CimInstance Win32_Service -Filter \"ProcessId={pid}\" | "
+        "Select-Object -First 1;"
+        "if ($s) { Write-Output (\"S|\" + $s.Name); }"
+    )
+    try:
+        rc = subprocess.run(["powershell", "-NoProfile", "-Command", ps_script],
+                            capture_output=True, text=True, encoding="utf-8",
+                            errors="replace", timeout=60,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        for line in (rc.stdout or "").splitlines():
+            if line.startswith("P|"):
+                _, name, path = line.split("|", 2)
+            elif line.startswith("S|"):
+                svc = line.split("|", 1)[1].strip()
+    except Exception:
+        pass
+    return pid, name, path, svc
+
+
+def stop_pid(pid: str) -> str:
+    """强制结束进程，返回空串（成功）或错误摘要。"""
+    try:
+        r = subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=30,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return "" if r.returncode == 0 else ((r.stderr or r.stdout or "").strip().splitlines()[-1])
+    except Exception as e:
+        return str(e)
+
+
 def wait_for_service(timeout: float = SERVICE_START_TIMEOUT) -> bool:
     """等待服务进入 RUNNING 且端口可连接。"""
     t0 = time.monotonic()
@@ -1009,12 +1061,30 @@ class InstallerApp:
                 return
             if wait_for_service():
                 self.log(f"✓ 服务 {SERVICE_NAME} 启动成功，端口 {DB_PORT} 可连接")
-            else:
-                # 端口打不开常见原因：僵尸 mysqld 占着端口（服务 SCM 状态与
-                # 实际进程不一致）。强杀本安装目录下的残留进程后再试一次
-                n_kill = kill_zombie_processes_home()
-                if n_kill:
-                    self.log(f"  强制结束了 {n_kill} 个占用进程，重试启动服务 ...")
+                return
+            # 端口打不开：先清掉本安装目录下的僵尸进程再试一次
+            n_kill = kill_zombie_processes_home()
+            if n_kill:
+                self.log(f"  强制结束了 {n_kill} 个本目录占用进程，重试启动服务 ...")
+                time.sleep(2)
+                subprocess.run(["net", "start", SERVICE_NAME], capture_output=True,
+                               text=True, timeout=180,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                if wait_for_service():
+                    self.log(f"✓ 服务 {SERVICE_NAME} 启动成功，端口 {DB_PORT} 可连接")
+                    return
+            # 仍打不开 → 端口被外来进程占用，报出占用者并强制结束
+            listener = describe_port_listener(DB_PORT)
+            if listener:
+                pid, name, path, svc = listener
+                self.log(f"⚠ 端口 {DB_PORT} 被外来进程占用：pid={pid} {name} "
+                         f"path={path or '未知'} service={svc or '无'}")
+                self.log(f"  为使本安装器的 MariaDB 使用端口 {DB_PORT}，强制结束该进程 ...")
+                err = stop_pid(pid)
+                if err:
+                    self.log(f"  ⚠ 强制结束失败：{err}")
+                else:
+                    self.log("  ✓ 已结束占用进程")
                     time.sleep(2)
                     subprocess.run(["net", "start", SERVICE_NAME], capture_output=True,
                                    text=True, timeout=180,
@@ -1022,7 +1092,7 @@ class InstallerApp:
                     if wait_for_service():
                         self.log(f"✓ 服务 {SERVICE_NAME} 启动成功，端口 {DB_PORT} 可连接")
                         return
-                self.log(f"⚠ 服务未确认运行，可手动执行 net start {SERVICE_NAME}")
+            self.log(f"⚠ 服务未确认运行，可手动执行 net start {SERVICE_NAME}")
         except Exception as e:
             self.log(f"⚠ 服务处理异常：{e}")
 
