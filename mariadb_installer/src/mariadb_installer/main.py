@@ -81,7 +81,7 @@ def find_my_ini(install_dir: Path | None = None) -> Path | None:
 
 
 def set_bind_address(my_ini: Path) -> bool:
-    """强制 my.ini 中 bind-address=BIND_ADDRESS（允许任意地址连接）。
+    """强制 my.ini 的 [mysqld] 段中 bind-address=BIND_ADDRESS（允许任意地址连接）。
 
     已是目标值返回 False；有修改返回 True（需重启服务生效）。
     """
@@ -89,20 +89,31 @@ def set_bind_address(my_ini: Path) -> bool:
         text = my_ini.read_text(encoding="utf-8", errors="ignore")
     except Exception:
         return False
+
     lines = text.splitlines()
-    replaced = False
     out = []
+    saw_mysqld = False
+    insert_at = None  # bind-address 应插入的 out 索引
     for line in lines:
         s = line.strip()
-        if s.startswith("#") and "bind-address" in s.lower():
-            continue
-        if s.lower().startswith("bind-address"):
-            out.append(f"bind-address={BIND_ADDRESS}")
-            replaced = True
-        else:
+        head = s.lower().replace(" ", "")
+        if head == "[mysqld]":
+            saw_mysqld = True
             out.append(line)
-    if not replaced:
-        out.append(f"bind-address={BIND_ADDRESS}")
+            continue
+        if not s.startswith(("#", ";")) and s.lower().startswith("bind-address"):
+            continue  # 丢弃任意段中的 bind-address（末段残留会让 mysql.exe 报 unknown variable）
+        if saw_mysqld and head.startswith("[") and head != "[mysqld]" and insert_at is None:
+            insert_at = len(out)  # 即将离开 [mysqld] 进入下一段，插在它前面
+        out.append(line)
+    if insert_at is None and saw_mysqld:
+        insert_at = len(out)  # [mysqld] 是最后一段，插件末尾
+    if not saw_mysqld:
+        out = ["[mysqld]", f"bind-address={BIND_ADDRESS}"] + out
+        insert_at = None
+    else:
+        out.insert(insert_at, f"bind-address={BIND_ADDRESS}")
+
     new_text = "\n".join(out) + "\n"
     if new_text == text:
         return False
@@ -113,14 +124,33 @@ def set_bind_address(my_ini: Path) -> bool:
     return True
 
 
+def start_service_unit() -> tuple[bool, str]:
+    """单次启动服务并等待端口就绪；net start 返回「已启动」也视为成功。"""
+    r = subprocess.run(["net", "start", SERVICE_NAME], capture_output=True, text=True,
+                       timeout=180, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    out = (r.stdout or r.stderr or "")
+    already_started = "2182" in out or "已经启动" in out or "already started" in out.lower()
+    ok = r.returncode == 0 or already_started
+    if not ok:
+        tail = [l.strip() for l in out.strip().splitlines() if l.strip()]
+        detail = tail[-1] if tail else f"returncode {r.returncode}"
+        return False, detail
+    return (True, "") if wait_for_service() else (False, "进程启动但端口未就绪")
+
+
 def restart_service() -> bool:
-    """重启 MariaDB 服务直至端口就绪，成功返回 True。"""
+    """重启 MariaDB 服务直至端口就绪；最多重试 3 次（首次启动含初始化可能很慢）。"""
     subprocess.run(["net", "stop", SERVICE_NAME], capture_output=True, text=True,
                    timeout=180, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    time.sleep(2)
-    subprocess.run(["net", "start", SERVICE_NAME], capture_output=True, text=True,
-                   timeout=180, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    return wait_for_service()
+    last_detail = ""
+    for attempt in range(3):
+        if attempt:
+            time.sleep(5)
+        ok, detail = start_service_unit()
+        if ok:
+            return True
+        last_detail = detail
+    raise RuntimeError(f"服务启动未就绪：{last_detail}")
 
 
 def bundle_dir() -> Path:
