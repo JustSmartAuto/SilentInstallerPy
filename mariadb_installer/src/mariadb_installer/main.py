@@ -195,7 +195,7 @@ def default_db_home() -> Path:
 DB_HOME = default_db_home()
 DATA_DIR = DB_HOME / "data"
 
-SERVICE_START_TIMEOUT = 90.0
+SERVICE_START_TIMEOUT = 60.0
 CLIENT_CMD_TIMEOUT = 60.0
 
 
@@ -407,12 +407,20 @@ def service_is_running() -> bool:
         return False
 
 
-def port_open(port: int, host: str = "127.0.0.1", timeout: float = 2.0) -> bool:
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
+def port_open(port: int, host: str = "", timeout: float = 2.0) -> bool:
+    """探测端口；host 为空时依次尝试 127.0.0.1 与本机局域网 IP。
+
+    单独绑 LAN IP 的监听（如 bind-address 指向具体网卡）127.0.0.1 探不到，
+    但服务是健康的，直等到 bind-address 规范步骤重启后才会双栈监听。
+    """
+    hosts = [host] if host else ["127.0.0.1", lan_ip()]
+    for h in hosts:
+        try:
+            with socket.create_connection((h, port), timeout=timeout):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def run_sql(client_exe: Path, user: str, password: str, sql: str,
@@ -1167,8 +1175,10 @@ class InstallerApp:
         # 服务处理（停止状态将启动；运行状态下仅确认端口）
         self.handle_service()
         if not port_open(DB_PORT):
-            self.update_status("前台启动 mysqld，捕获启动报错 ...")
-            self.run_mysqld_console_diag()
+            # 先尝试终极自愈（重建数据目录再引导）
+            if not self.reset_data_and_bootstrap(client_exe):
+                self.update_status("前台启动 mysqld，捕获启动报错 ...")
+                self.run_mysqld_console_diag()
             time.sleep(2)
             subprocess.run(["net", "start", SERVICE_NAME], capture_output=True,
                            text=True, timeout=180,
@@ -1196,7 +1206,10 @@ class InstallerApp:
 
         self.root.after(0, lambda: self.progress_var.set(90))
 
-        # 创建管理员账号
+        # 创建管理员账号（先确认端口可连，避免对僵尸进程徒劳超时）
+        if not port_open(DB_PORT):
+            raise RuntimeError(
+                f"端口 {DB_PORT} 不可连接，跳过建号；请重跑安装器触发终极自愈（重建数据目录）")
         self.update_status(f"创建管理员账号 {ADMIN_USER} ...")
         try:
             used_pw = create_admin_account(client_exe)
@@ -1277,7 +1290,10 @@ class InstallerApp:
             if wait_for_service():
                 self.log(f"✓ 服务 {SERVICE_NAME} 启动成功，端口 {DB_PORT} 可连接")
                 return
-            # 端口打不开：先清掉本安装目录下的僵尸进程再试一次
+            # 端口打不开：先把 SCM 僵尸状态清干净（net stop 忽略 1062），再清本安装目录下的僵尸进程后重试
+            subprocess.run(["net", "stop", SERVICE_NAME], capture_output=True,
+                           text=True, timeout=120,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             n_kill = kill_zombie_processes_home()
             if n_kill:
                 self.log(f"  强制结束了 {n_kill} 个本目录占用进程，重试启动服务 ...")
@@ -1310,6 +1326,62 @@ class InstallerApp:
             self.log(f"⚠ 服务未确认运行，可手动执行 net start {SERVICE_NAME}")
         except Exception as e:
             self.log(f"⚠ 服务处理异常：{e}")
+
+    def reset_data_and_bootstrap(self, client_exe) -> bool:
+        """终极自愈：停服/杀僵尸 + 重建数据目录 + 引导系统表 + 授权 + 起服务。"""
+        try:
+            self.log("\n  终极自愈：重建数据目录并重新引导系统表 ...")
+            subprocess.run(["net", "stop", SERVICE_NAME], capture_output=True,
+                           text=True, timeout=120,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            kill_zombie_processes_home()
+            listener = describe_port_listener(DB_PORT)
+            if listener:
+                err = stop_pid(listener[0])
+                self.log(f"    已结束端口占用进程 pid={listener[0]}"
+                         + (f"（{err}）" if err else ""))
+                time.sleep(1)
+            install_dir = client_exe.parent.parent
+            my_ini = DATA_DIR / "my.ini"
+            if not my_ini.exists():
+                my_ini = ensure_my_ini()
+            stash = DB_HOME / "my.ini.stash"
+            try:
+                my_ini.replace(stash)
+            except OSError:
+                stash = None
+            self.log(f"    清空数据目录 {DATA_DIR}（引导失败状态下无用户数据）...")
+            clear_data_dir_keep(my_ini)
+            if not DATA_DIR.exists():
+                DATA_DIR.mkdir(parents=True, exist_ok=True)
+            lines = bootstrap_system_tables(install_dir, my_ini)
+            for line in lines[-5:]:
+                if line:
+                    self.log(f"    {line}")
+            if stash and stash.exists():
+                try:
+                    shutil.copy2(stash, DATA_DIR / "my.ini")
+                    stash.unlink()
+                except Exception:
+                    pass
+            if not system_tables_present():
+                self.log("    ⚠ 重建引导仍未成功")
+                return False
+            self.log("    ✓ 系统表重建完成")
+            err = grant_service_account_dbhome()
+            if err:
+                self.log(f"    ⚠ 授予服务账号目录权限失败：{err}")
+            subprocess.run(["net", "start", SERVICE_NAME], capture_output=True,
+                           text=True, timeout=180,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if wait_for_service():
+                self.log(f"    ✓ 重建后服务启动成功，端口 {DB_PORT} 可连接")
+                return True
+            self.log("    ✗ 重建后服务仍未能启动")
+            return False
+        except Exception as e:
+            self.log(f"    ⚠ 终极自愈异常：{e}")
+            return False
 
     # ---------- 工具 ----------
     def update_status(self, msg: str):
