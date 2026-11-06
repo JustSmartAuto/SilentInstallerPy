@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import zipfile
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -308,6 +309,25 @@ def bundle_dir() -> Path:
         if c.exists():
             return c
     return candidates[0]
+
+
+GHOST_ZIP_NAME = "mariadb_data_13.0.2.zip"
+
+
+def ghost_zip_path() -> Path | None:
+    """内嵌的现成数据目录包（thinkbook 健康实例，含 mysql 系统表/justsmart 账号）。"""
+    p = bundle_dir() / GHOST_ZIP_NAME
+    return p if p.exists() and p.stat().st_size > 1024 else None
+
+
+def ghost_extract() -> int:
+    """解包 ghost 数据目录到 DATA_DIR，返回解出的文件数（失败抛异常）。"""
+    src = ghost_zip_path()
+    if not src:
+        return 0
+    with zipfile.ZipFile(src) as zf:
+        zf.extractall(DATA_DIR)
+    return sum(1 for p in DATA_DIR.rglob("*") if p.is_file())
 
 
 def find_install_dir() -> Path | None:
@@ -1318,9 +1338,9 @@ class InstallerApp:
         my_ini = ensure_my_ini()
         self.log(f"  my.ini：{my_ini}")
         if not system_tables_present():
-            self.log("  数据目录未初始化，清理残留后执行 mariadb-install-db 引导系统表（可能需要 1~2 分钟）...")
-            # install-db 要求 datadir 完全为空：my.ini 先挪出数据目录暂存，
-            # 引导完成后再放回（服务的 --defaults-file 指向数据目录内）
+            # install-db/解包都要求 datadir 完全为空：my.ini 先挪出数据目录暂存，
+            # 完成后再放回（服务的 --defaults-file 指向数据目录内）
+            self.log("  数据目录未初始化，清理残留后重建系统表 ...")
             stash = DB_HOME / "my.ini.stash"
             try:
                 my_ini.replace(stash)
@@ -1331,10 +1351,21 @@ class InstallerApp:
                 DATA_DIR.mkdir(parents=True, exist_ok=True)
             if n:
                 self.log(f"    已清理 {n} 个未完成的初始化残留（无 mysql 系统库，无用户数据）")
-            lines = bootstrap_system_tables(install_dir, my_ini)
-            for line in lines[-8:]:
-                if line:
-                    self.log(f"    {line}")
+            ghost = ghost_zip_path()
+            if ghost:
+                self.log(f"    优先解包内嵌现成数据目录 {GHOST_ZIP_NAME}"
+                         f"（含 mysql 系统表与 {ADMIN_USER} 账号，来自健康实例）...")
+                try:
+                    n_files = ghost_extract()
+                    self.log(f"    ✓ 解包 {n_files} 个文件完成")
+                except Exception as e:
+                    self.log(f"    ⚠ ghost 解包失败（{e}），回退 mariadb-install-db ...")
+            if not system_tables_present():
+                self.log("    用 mariadb-install-db 引导系统表（可能需要 1~2 分钟）...")
+                lines = bootstrap_system_tables(install_dir, my_ini)
+                for line in lines[-8:]:
+                    if line:
+                        self.log(f"    {line}")
             if stash and stash.exists():
                 try:
                     shutil.copy2(stash, DATA_DIR / "my.ini")
@@ -1563,10 +1594,19 @@ class InstallerApp:
             clear_data_dir_keep(my_ini)
             if not DATA_DIR.exists():
                 DATA_DIR.mkdir(parents=True, exist_ok=True)
-            lines = bootstrap_system_tables(install_dir, my_ini)
-            for line in lines[-5:]:
-                if line:
-                    self.log(f"    {line}")
+            ghost = ghost_zip_path()
+            if ghost:
+                self.log(f"    优先解包内嵌现成数据目录 {GHOST_ZIP_NAME} ...")
+                try:
+                    n_files = ghost_extract()
+                    self.log(f"    ✓ 解包 {n_files} 个文件完成")
+                except Exception as e:
+                    self.log(f"    ⚠ ghost 解包失败（{e}），回退 mariadb-install-db ...")
+            if not system_tables_present():
+                lines = bootstrap_system_tables(install_dir, my_ini)
+                for line in lines[-5:]:
+                    if line:
+                        self.log(f"    {line}")
             if stash and stash.exists():
                 try:
                     shutil.copy2(stash, DATA_DIR / "my.ini")

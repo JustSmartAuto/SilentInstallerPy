@@ -9,7 +9,7 @@ from pathlib import Path
 
 SERVICE = "MariaDB"
 DATA = Path(r"D:\JustSmart\MariaDB\data")
-OUT = Path(r"D:\JustStupid\silent安装器_2606231854\assets")
+OUT = Path(r"D:\JustStupid\silent安装器_2606231854\mariadb_installer\assets")
 OUT.mkdir(parents=True, exist_ok=True)
 ZIP_PATH = OUT / "mariadb_data_13.0.2.zip"
 
