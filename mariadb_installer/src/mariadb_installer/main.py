@@ -59,7 +59,11 @@ CLIENT_CMD_TIMEOUT = 60.0
 
 
 def ensure_dirs() -> None:
-    """安装/数据目录不存在时自动创建。"""
+    """目录不存在时自动创建（安装完成/回退路径兜底）。
+
+    注意：只能在 MSI 安装完成后或更新配置时调用；MSI 要求 INSTALLDIR 在
+    全新安装时不预先存在，否则返回 1603（"directory exists and is not empty"）。
+    """
     for d in (DB_HOME, DATA_DIR):
         if not d.exists():
             d.mkdir(parents=True, exist_ok=True)
@@ -264,6 +268,71 @@ def run_sql(client_exe: Path, user: str, password: str, sql: str,
         detail = err_norm[-1] if err_norm else f"returncode {r.returncode}"
         raise RuntimeError(f"SQL 执行失败：{detail}")
     return out
+
+
+def read_text_auto(path: Path) -> str:
+    """读取文本并自动识别编码（msiexec /L*v 日志为 UTF-16LE）。"""
+    raw = path.read_bytes()
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return raw.decode("utf-16", errors="ignore").lstrip("\ufeff")
+    return raw.decode("utf-8", errors="ignore")
+
+
+def extract_msi_log_errors(msi_log: Path, max_lines: int = 8) -> str:
+    """从 msiexec /L*v 日志中提取错误相关行（找不到日志返回空串）。"""
+    markers = ["error 1", "return value 3", "installation directory", "not empty",
+               "failed", "error 2", "mainenginethread"]
+    try:
+        lines = read_text_auto(msi_log).splitlines()
+    except Exception:
+        return ""
+    hits = []
+    seen = set()
+    for line in reversed(lines):
+        s = line.strip()
+        if not s:
+            continue
+        low = s.lower()
+        if any(m in low for m in markers):
+            if "property change" in low or s in seen:
+                continue
+            seen.add(s)
+            hits.append(s)
+        if len(hits) >= max_lines:
+            break
+    return " / ".join(reversed(hits))
+
+
+def remove_empty_tree(root: Path) -> int:
+    """自底向上删除空目录树；只要树中存在任何文件则不动该分支。
+
+    返回删除的目录数。用于卸载后清掉 MSI 留下的空目录残留
+    （MSI 拒绝安装进已存在的非空 INSTALLDIR）。
+    """
+    if not root.exists():
+        return 0
+    has_file = False
+    removed = 0
+    try:
+        entries = sorted(root.rglob("*"), key=lambda p: len(p.parts), reverse=True)
+    except Exception:
+        return 0
+    for p in entries:
+        try:
+            if p.is_dir():
+                p.rmdir()
+                removed += 1
+            else:
+                has_file = True
+        except OSError:
+            has_file = True
+    if not has_file:
+        try:
+            root.rmdir()
+            removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 def wait_for_service(timeout: float = SERVICE_START_TIMEOUT) -> bool:
@@ -546,18 +615,51 @@ class InstallerApp:
             self.log("已存在 MariaDB 服务，跳过重复安装")
             return
 
-        # 目录不存在自动创建；无 D 盘时回退 %APPDATA%/MariaDB）
-        fallback_tag = "（无 D 盘，回退到 %APPDATA%/MariaDB）" if not Path("D:/").exists() else ""
-        self.log(f"数据目录：{DB_HOME}{fallback_tag}")
-        try:
-            ensure_dirs()
-            self.log(f"✓ 目录就绪：{DB_HOME} / {DATA_DIR}")
-        except Exception as e:
-            raise RuntimeError(f"创建安装/数据目录失败：{e}")
+        # 不完整安装自愈：有服务端残留但没有 mysql.exe 客户端（如只装了
+        # MYSQLSERVER 父 Feature 而未装 Client/DBInstance 子 Feature），
+        # 先静默卸载残留，再按完整 Feature 列表重装
+        partial_server = (DB_HOME / "bin" / "mariadbd.exe").exists()
+        if not self.db_existing_client and partial_server:
+            self.log("检测到不完整的 MariaDB 安装（缺少客户端/实例配置），正在清理 ...")
+            self.temp_dir.mkdir(parents=True, exist_ok=True)
+            r_un = subprocess.run(
+                ["msiexec", "/x", str(msi_path), "/qn", "/norestart",
+                 "/L*v", str(self.temp_dir / "mariadb-uninstall.log")],
+                capture_output=True, text=True, timeout=900,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if r_un.returncode == 0:
+                self.log("✓ 残留卸载完成")
+                n = remove_empty_tree(DB_HOME)
+                if DB_HOME.exists() and any(DB_HOME.iterdir()):
+                    raise RuntimeError(
+                        f"残留清理后 {DB_HOME} 仍存在文件，MSI 无法安装进非空目录；"
+                        "请确认无重要数据后手动删除该目录再安装")
+                if n:
+                    self.log(f"✓ 已清理 {n} 个空目录残留")
+                self.log("开始重新安装")
+            else:
+                self.log(f"⚠ 旧包卸载返回码 {r_un.returncode}（未安装则可忽略），继续安装 ...")
 
+        # 安装前检查：MSI 拒绝安装进已存在的非空 INSTALLDIR；
+        # 若仅剩空目录残留（无任何文件）则自动清理
+        if not self.db_existing_client and DB_HOME.exists() and any(DB_HOME.iterdir()):
+            remove_empty_tree(DB_HOME)
+            if DB_HOME.exists() and any(DB_HOME.iterdir()):
+                raise RuntimeError(
+                    f"安装目录 {DB_HOME} 已存在且有内容，MSI 拒绝安装（1603）；"
+                    "请确认无重要数据后手动删除该目录再安装")
+
+        # 无 D 盘时回退 %APPDATA%/MariaDB（目录由 MSI 自动创建，不可预先创建：
+        # MSI 要求全新安装时 INSTALLDIR 不存在，否则返回 1603）
+        fallback_tag = "（无 D 盘，回退到 %APPDATA%/MariaDB）" if not Path("D:/").exists() else ""
+        self.log(f"数据库目录：{DB_HOME}{fallback_tag}")
+
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        msi_log = self.temp_dir / "mariadb-install.log"
         self.log(f"运行内嵌安装包：{msi_path.name}（msiexec /qn 静默安装，请批准 UAC 提示）")
         cmd = ["msiexec", "/i", str(msi_path), "/qn", "/norestart",
-               "ADDLOCAL=MYSQLSERVER",
+               "/L*v", str(msi_log),
+               "ADDLOCAL=MYSQLSERVER,Client,SharedClientServerComponents,DBInstance,Backup",
                f"INSTALLDIR={DB_HOME}",
                f"DATADIR={DATA_DIR}",
                f"PORT={DB_PORT}",
@@ -569,8 +671,21 @@ class InstallerApp:
         r = subprocess.run(cmd, capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=1800)
         if r.returncode != 0:
-            raise RuntimeError(f"MariaDB MSI 返回码 {r.returncode}：{r.stderr or r.stdout}")
+            detail = (r.stderr or r.stdout or "").strip()
+            if not detail:
+                detail = extract_msi_log_errors(msi_log)
+            if r.returncode == 1603:
+                detail = detail or "（详见 MSI 日志）"
+                detail += " | 常见原因：安装目录已存在且有内容、旧服务未卸载、UAC 被拒绝"
+            raise RuntimeError(f"MariaDB MSI 返回码 {r.returncode}：{detail}")
         self.root.after(0, lambda: self.progress_var.set(70))
+
+        # 兜底自动创建目录（MSI 完成后仍缺目录时补齐，含回退路径）
+        try:
+            ensure_dirs()
+            self.log(f"✓ 目录就绪：{DB_HOME} / {DATA_DIR}")
+        except Exception as e:
+            self.log(f"⚠ 目录兜底创建异常：{e}")
 
         client_exe = find_client_exe()
         if not client_exe:
