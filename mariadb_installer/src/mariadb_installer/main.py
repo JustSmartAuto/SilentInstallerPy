@@ -407,19 +407,51 @@ def service_is_running() -> bool:
         return False
 
 
-def port_open(port: int, host: str = "", timeout: float = 2.0) -> bool:
-    """探测端口；host 为空时依次尝试 127.0.0.1 与本机局域网 IP。
+def all_local_ips() -> list:
+    """列出本机全部 IPv4 地址（lan_ip 可能选错多网卡机器的网卡）。"""
+    ips = []
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            ips.append(s.getsockname()[0])
+        except OSError:
+            pass
+        finally:
+            s.close()
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None,
+                                       family=socket.AF_INET):
+            ip = info[4][0]
+            if ip not in ips and ip != "127.0.0.1":
+                ips.append(ip)
+    except OSError:
+        pass
+    return ips
 
-    单独绑 LAN IP 的监听（如 bind-address 指向具体网卡）127.0.0.1 探不到，
-    但服务是健康的，直等到 bind-address 规范步骤重启后才会双栈监听。
+
+def port_open(port: int, host: str = "", timeout: float = 2.0) -> bool:
+    """探测端口；host 为空时依次尝试 127.0.0.1 与本机全部 IPv4。
+
+    兜底：全部连不上但 netstat 上"我们的 mysqld"正在 LISTEN，
+    也算开着（loopback 被杀软/代理拦截的机器仍可远程访问）。
     """
-    hosts = [host] if host else ["127.0.0.1", lan_ip()]
+    hosts = [host] if host else ["127.0.0.1"] + all_local_ips()
     for h in hosts:
         try:
             with socket.create_connection((h, port), timeout=timeout):
                 return True
         except OSError:
             continue
+    if host:
+        return False
+    listener = describe_port_listener(port)
+    if listener and listener[2]:
+        path = str(listener[2]).lower()
+        if path.startswith(str(DB_HOME).lower() + "\\"):
+            return True
     return False
 
 
@@ -551,6 +583,73 @@ def kill_zombie_processes_home() -> int:
         except Exception:
             continue
     return killed
+
+
+def home_processes_alive() -> list:
+    """列出可执行路径位于 DB_HOME 之下的存活进程 [(pid, name)]，用于杀后验证。"""
+    if sys.platform != "win32" or not DB_HOME.exists():
+        return []
+    pattern = str(DB_HOME).rstrip("\\") + "\\*"
+    ps_script = (
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8;"
+        "Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like "
+        f"'{pattern}' }} | ForEach-Object {{ Write-Output "
+        "($_.ProcessId.ToString() + '|' + $_.Name) }"
+    )
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps_script],
+                           capture_output=True, text=True, timeout=90,
+                           encoding="utf-8", errors="replace",
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:
+        return []
+    alives = []
+    for line in (r.stdout or "").splitlines():
+        pid_s, _, name = line.strip().partition("|")
+        if pid_s.strip().isdigit():
+            alives.append((int(pid_s), name))
+    return alives
+
+
+def dump_latest_err_log(limit: int = 30) -> list:
+    """转储数据目录最新 *.err 末 limit 行（mysqld 启动失败的官方报错在错误日志里）。"""
+    if not DATA_DIR.exists():
+        return ["(数据目录不存在，无 *.err)"]
+    err_files = sorted(DATA_DIR.glob("*.err"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+    if not err_files:
+        return ["(数据目录没有 *.err 文件)"]
+    f = err_files[0]
+    try:
+        st = f.stat()
+        head = [f"--- {f.name}（mtime {time.strftime('%H:%M:%S', time.localtime(st.st_mtime))}，"
+                f"{st.st_size} 字节）末 {limit} 行 ---"]
+        lines = (read_text_auto(f).splitlines() or [""])
+        return head + lines[-limit:]
+    except Exception as e:
+        return [f"--- {f.name}（读取失败：{e}）"]
+
+
+def probe_file_writable() -> list:
+    """核对 ibdata1 等核心文件可写性（杀软/受控文件夹访问拦截时在此现形）。"""
+    out = []
+    for name in ("ibdata1", "aria_log_control", "aria_log.00000001"):
+        p = DATA_DIR / name
+        if not p.exists():
+            out.append(f"  {name}：不存在")
+            continue
+        try:
+            ro = bool(p.stat().st_file_attributes & 0x1)  # FILE_ATTRIBUTE_READONLY
+        except OSError:
+            ro = False
+        try:
+            with open(p, "r+b") as fh:
+                fh.read(4)
+            status = "OK"
+        except OSError as e:
+            status = f"失败（{e}）"
+        out.append(f"  {name}：只读属性={'是' if ro else '否'}，写测试={status}")
+    return out
 
 
 def force_wipe_home() -> bool:
@@ -737,12 +836,23 @@ def bootstrap_system_tables(install_dir: Path, my_ini: Path) -> list[str]:
     return last_out
 
 
-def create_admin_account(client_exe: Path) -> str:
+def create_admin_account(client_exe: Path, log_fn=None) -> str:
     """创建管理员账号 justsmart，授予全部权限并可从任意主机连接。
 
     root 密码先试 ROOT_PASSWORD，失败回退空密码（install-db 引导默认），
-    成功后统一把 root@localhost 密码设为 ROOT_PASSWORD。返回实际使用的 root 密码。
+    成功后统一把 root@localhost 密码设为 ROOT_PASSWORD。
+    连接宿主依序尝试（loopback 被拦的机器换 localhost/本机 IP 再试）。
+    全部失败则启用 init-file 兜底：把建号 SQL 交给 mysqld 启动时特权执行。
+    返回实际使用的 root 密码。
     """
+    log = log_fn or (lambda *a, **k: None)
+
+    def msg(text):
+        try:
+            log(text)
+        except Exception:
+            pass
+
     esc = ADMIN_PASSWORD.replace("'", "''")
     root_esc = ROOT_PASSWORD.replace("'", "''")
     sql = (
@@ -754,33 +864,105 @@ def create_admin_account(client_exe: Path) -> str:
         f"GRANT ALL PRIVILEGES ON *.* TO '{ADMIN_USER}'@'localhost' WITH GRANT OPTION;"
         "FLUSH PRIVILEGES;"
     )
+    hosts = ["127.0.0.1", "localhost"] + all_local_ips()
     last_err = None
-    used_pw = ROOT_PASSWORD
+    used_pw = None
     for pw in (ROOT_PASSWORD, "", "root"):
-        try:
-            run_sql(client_exe, "root", pw, sql, host="localhost")
-            used_pw = pw
+        for host in hosts:
+            try:
+                run_sql(client_exe, "root", pw, sql, host=host)
+                used_pw = pw
+                msg(f"    ✓ root 连接成功：host={host} "
+                    f"密码={'justsmart' if pw == ROOT_PASSWORD else ('<空>' if pw == '' else pw)}")
+                break
+            except RuntimeError as e:
+                last_err = e
+        if used_pw is not None:
             break
-        except RuntimeError as e:
-            last_err = e
-    else:
-        raise RuntimeError(f"以 root 连接失败（尝试密码 justsmart/空/root）：{last_err}")
-    if used_pw != ROOT_PASSWORD:
+    if used_pw is None:
+        msg("    ⚠ 本地 mysql.exe 将无法连接，改走 init-file 兜底（由 mysqld 特权执行建号 SQL）...")
+        _bootstrap_accounts_via_init_file(client_exe, log_fn, sql,
+                                          f"ALTER USER 'root'@'localhost' IDENTIFIED BY '{root_esc}';")
         try:
-            run_sql(client_exe, "root", used_pw,
-                    f"ALTER USER 'root'@'localhost' IDENTIFIED BY '{root_esc}';",
-                    host="localhost")
+            run_sql(client_exe, ADMIN_USER, ADMIN_PASSWORD, "SELECT 1;", host="127.0.0.1")
         except RuntimeError:
-            pass  # root 密码设置失败不阻塞安装
+            # 本地连不上不代表没建成，远端 '%' 账号交给最后的连接测试验证
+            msg("    （本机客户端仍不能回连，建号结果交给最终连接测试）")
+        return ROOT_PASSWORD
+    if used_pw != ROOT_PASSWORD:
+        for host in hosts:
+            try:
+                run_sql(client_exe, "root", used_pw,
+                        f"ALTER USER 'root'@'localhost' IDENTIFIED BY '{root_esc}';",
+                        host=host)
+                break
+            except RuntimeError:
+                continue  # root 密码设置失败不阻塞安装
     return used_pw
+
+
+def _bootstrap_accounts_via_init_file(client_exe: Path, log_fn, admin_sql: str,
+                                      root_sql: str):
+    """init-file 兜底：把建号 SQL 写成文件并挂到 my.ini 的 init-file，重启服务执行。
+
+    mysqld 启动时以 root@localhost 身份执行 init-file 中的脚本，不依赖客户端连接。
+    执行成功后立即撤销 init-file 配置并删除 SQL 文件。
+    """
+    log = log_fn or (lambda *a, **k: None)
+
+    def msg(text):
+        try:
+            log(text)
+        except Exception:
+            pass
+
+    sql_path = DATA_DIR / "bootstrap_accounts.sql"
+    my = find_my_ini()
+    if not my:
+        msg("    ✗ init-file 兜底失败：找不到 my.ini")
+        return
+    sql_path.write_text(admin_sql + root_sql, encoding="utf-8")
+    # 幂等：摘掉旧的 init-file 行
+    text = read_text_auto(my)
+    lines = [l for l in text.splitlines() if "init-file" not in l.lower()]
+    marker_idx = next((i for i, l in enumerate(lines)
+                       if l.strip().lower() == "[mysqld]"), None)
+    ini_line = f"init-file={sql_path}"
+    lines.insert(marker_idx + 1 if marker_idx is not None else 0,
+                 ini_line if marker_idx is not None else "[mysqld]")
+    my.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    msg(f"    init-file 已挂载：{ini_line}（重启服务执行）")
+    if not restart_service():
+        msg("    ✗ init-file 兜底失败：服务重启未就绪")
+        return
+    # 撤销 init-file 并删掉 SQL 文件
+    lines = [l for l in lines if l != ini_line
+             and not l.strip().lower().startswith("init-file=")]
+    if marker_idx is None:
+        lines = [l for l in lines if l.strip().lower() != "[mysqld]"]
+    my.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    try:
+        sql_path.unlink()
+    except OSError:
+        pass
+    msg("    ✓ init-file 兜底完成，配置已撤除")
 
 
 def db_connection_test(client_exe: Path, user: str = ADMIN_USER,
                        password: str = ADMIN_PASSWORD) -> str:
-    """以指定账号连接 127.0.0.1:8306 执行 SQL 测试，返回摘要（失败抛异常）。"""
-    out = run_sql(client_exe, user, password,
-                  "SELECT VERSION() AS version, CURRENT_USER() AS user, "
-                  "@@port AS port, @@bind_address AS bind;")
+    """以指定账号依次尝试本机多个宿主执行 SQL 测试，返回摘要（失败抛异常）。"""
+    last = None
+    out = ""
+    for host in ["127.0.0.1", "localhost"] + all_local_ips():
+        try:
+            out = run_sql(client_exe, user, password,
+                          "SELECT VERSION() AS version, CURRENT_USER() AS user, "
+                          "@@port AS port, @@bind_address AS bind;", host=host)
+            break
+        except RuntimeError as e:
+            last = e
+    else:
+        raise last or RuntimeError("数据库连接测试失败：无可用连接宿主")
     first = "; ".join(line.strip() for line in out.strip().splitlines() if line.strip())
     if "0.0.0.0" not in first and "*" not in first:
         raise RuntimeError(f"数据库未监听 0.0.0.0（bind_address 查询结果：{first.split('|')[-1].strip()}），"
@@ -1184,6 +1366,7 @@ class InstallerApp:
                            text=True, timeout=180,
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             if not wait_for_service() or not port_open(DB_PORT):
+                self.dump_failure_diagnostics("服务未能启动")
                 err_hint = (DATA_DIR / "*.err") if DATA_DIR.exists() else "<数据目录>/*.err"
                 raise RuntimeError(
                     f"服务 {SERVICE_NAME} 未能启动且端口 {DB_PORT} 不可连接，无法继续配置；"
@@ -1212,11 +1395,12 @@ class InstallerApp:
                 f"端口 {DB_PORT} 不可连接，跳过建号；请重跑安装器触发终极自愈（重建数据目录）")
         self.update_status(f"创建管理员账号 {ADMIN_USER} ...")
         try:
-            used_pw = create_admin_account(client_exe)
+            used_pw = create_admin_account(client_exe, self.log)
             pw_note = f"（root 初始密码为空，已自动补设为 {ROOT_PASSWORD}）" if used_pw != ROOT_PASSWORD else ""
             self.log(f"✓ 管理员账号已创建：{ADMIN_USER}@'%' / {ADMIN_USER}@'localhost' "
                      f"（全部权限，允许远程连接）{pw_note}")
         except Exception as e:
+            self.dump_failure_diagnostics("创建管理员账号失败")
             raise RuntimeError(f"创建管理员账号失败：{e}")
 
     def run_mysqld_console_diag(self):
@@ -1295,6 +1479,12 @@ class InstallerApp:
                            text=True, timeout=120,
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             n_kill = kill_zombie_processes_home()
+            alives = home_processes_alive()
+            if n_kill or alives:
+                self.log(f"  杀掉 {n_kill} 个本目录进程；"
+                         + (f"⚠ 仍有 {len(alives)} 个杀不掉存活："
+                            + ", ".join(f"pid={p} {n}" for p, n in alives) if alives
+                            else "已验证死透"))
             if n_kill:
                 self.log(f"  强制结束了 {n_kill} 个本目录占用进程，重试启动服务 ...")
                 time.sleep(2)
@@ -1326,6 +1516,25 @@ class InstallerApp:
             self.log(f"⚠ 服务未确认运行，可手动执行 net start {SERVICE_NAME}")
         except Exception as e:
             self.log(f"⚠ 服务处理异常：{e}")
+
+    def dump_failure_diagnostics(self, stage: str):
+        """失败现场取证：B.chomp 存活进程 + 最新 .err 末 30 行 + 核心文件可写性。"""
+        try:
+            self.log(f"\n【{stage}】失败诊断 ...")
+            alives = home_processes_alive()
+            if alives:
+                self.log("  存活进程（本安装目录下）：")
+                for pid, name in alives:
+                    self.log(f"    pid={pid} {name}")
+            else:
+                self.log("  存活进程（本安装目录下）：无")
+            for line in dump_latest_err_log():
+                self.log(f"  {line}")
+            self.log("  核心文件可写性（杀软拦截在此现形）：")
+            for line in probe_file_writable():
+                self.log(line)
+        except Exception as e:
+            self.log(f"  ⚠ 诊断过程异常：{e}")
 
     def reset_data_and_bootstrap(self, client_exe) -> bool:
         """终极自愈：停服/杀僵尸 + 重建数据目录 + 引导系统表 + 授权 + 起服务。"""
@@ -1378,6 +1587,7 @@ class InstallerApp:
                 self.log(f"    ✓ 重建后服务启动成功，端口 {DB_PORT} 可连接")
                 return True
             self.log("    ✗ 重建后服务仍未能启动")
+            self.dump_failure_diagnostics("重建后服务仍未能启动")
             return False
         except Exception as e:
             self.log(f"    ⚠ 终极自愈异常：{e}")
