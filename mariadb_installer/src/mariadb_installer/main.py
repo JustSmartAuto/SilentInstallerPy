@@ -369,12 +369,14 @@ def find_client_exe() -> Path | None:
 
 
 def get_version(client_exe: Path) -> str:
-    """mysql --version 输出：mysql from Ver ... for Win64 on x86 (MariaDB 13.0.2)。"""
+    """mysql --version 输出：mysql Ver 15.2 Distrib 13.0.2-MariaDB, for Win64 (AMD64)。"""
     try:
         r = subprocess.run([str(client_exe), "--version"], capture_output=True, text=True,
                            timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         out = (r.stdout or "") + (r.stderr or "")
         m = re.search(r"MariaDB\s+([0-9.]+)", out)
+        if not m:
+            m = re.search(r"([0-9]+\.[0-9]+(?:\.[0-9]+)?)\s*-?MariaDB", out)
         return m.group(1) if m else ""
     except Exception:
         return ""
@@ -623,9 +625,118 @@ def wait_for_service(timeout: float = SERVICE_START_TIMEOUT) -> bool:
     return False
 
 
-def create_admin_account(client_exe: Path) -> None:
-    """创建管理员账号 justsmart，授予全部权限并可从任意主机连接。"""
+def ensure_my_ini() -> Path:
+    """确保 my.ini 存在（MSI 维护模式重装可能不生成实例配置）。
+
+    找不到时在数据目录生成一份最小可用配置（datadir/port/bind-address）。
+    """
+    my = find_my_ini()
+    if my:
+        return my
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    target = DATA_DIR / "my.ini"
+    body = (
+        "[mysqld]\n"
+        f"datadir={DATA_DIR.as_posix()}\n"
+        f"port={DB_PORT}\n"
+        f"bind-address={BIND_ADDRESS}\n"
+        "skip-name-resolve\n"
+        "\n[client]\n"
+        f"port={DB_PORT}\n"
+    )
+    target.write_text(body, encoding="utf-8")
+    return target
+
+
+def system_tables_present() -> bool:
+    """数据目录是否已初始化（存在 mysql 系统库且非空）。"""
+    sysdb = DATA_DIR / "mysql"
+    return sysdb.exists() and any(sysdb.iterdir())
+
+
+def clear_data_dir_keep(my_ini: Path) -> int:
+    """清空数据目录内容但保留 my.ini（仅当不存在 mysql 系统库时调用，此时无用户数据）。"""
+    if not DATA_DIR.exists():
+        return 0
+    removed = 0
+    for p in DATA_DIR.iterdir():
+        if p == my_ini:
+            continue
+        try:
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=False)
+            else:
+                p.unlink()
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def grant_service_account_dbhome() -> str:
+    """授予 NT SERVICE\\MariaDB 对安装/数据目录的完全控制（全新 datadir 必需）。"""
+    err = ""
+    for target in (DB_HOME, DATA_DIR):
+        try:
+            r = subprocess.run(["icacls", str(target), "/grant",
+                                f"NT SERVICE\\{SERVICE_NAME}:(OI)(CI)F", "/T", "/C", "/Q"],
+                               capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=120,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if r.returncode != 0:
+                tail = ((r.stderr or r.stdout or "").strip().splitlines() or [""])[-1]
+                err = err or tail
+        except Exception as e:
+            err = err or str(e)
+    return err
+
+
+def bootstrap_system_tables(install_dir: Path, my_ini: Path) -> list[str]:
+    """用内置 mariadb-install-db.exe 引导系统表，返回输出行列表。
+
+    Windows 版 mariadb-install-db 不支持 --defaults-file；
+    先带 --password/--port，遇到未知选项再回退最小参数。
+    """
+    dbi = install_dir / "bin" / "mariadb-install-db.exe"
+    if not dbi.exists():
+        return ["(mariadb-install-db.exe 不存在)"]
+    attempts = [
+        [str(dbi), f"--datadir={DATA_DIR}", f"--port={DB_PORT}",
+         f"--password={ROOT_PASSWORD}"],
+        [str(dbi), f"--datadir={DATA_DIR}"],
+    ]
+    out = subprocess_output = None
+    last_out = []
+    for cmd in attempts:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=900,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception as e:
+            last_out = [f"(执行 mariadb-install-db 异常：{e})"]
+            continue
+        last_out = []
+        for src in ((r.stdout or "").splitlines(), (r.stderr or "").splitlines()):
+            for l in src:
+                l = l.strip()
+                if l and l not in last_out:
+                    last_out.append(l)
+        if r.returncode == 0:
+            return last_out
+        joined = "\n".join(last_out).lower()
+        if "unknown" not in joined and "unrecognized" not in joined:
+            break
+    return last_out
+
+
+def create_admin_account(client_exe: Path) -> str:
+    """创建管理员账号 justsmart，授予全部权限并可从任意主机连接。
+
+    root 密码先试 ROOT_PASSWORD，失败回退空密码（install-db 引导默认），
+    成功后统一把 root@localhost 密码设为 ROOT_PASSWORD。返回实际使用的 root 密码。
+    """
     esc = ADMIN_PASSWORD.replace("'", "''")
+    root_esc = ROOT_PASSWORD.replace("'", "''")
     sql = (
         f"CREATE USER IF NOT EXISTS '{ADMIN_USER}'@'%' IDENTIFIED BY '{esc}';"
         f"ALTER USER '{ADMIN_USER}'@'%' IDENTIFIED BY '{esc}';"
@@ -635,7 +746,25 @@ def create_admin_account(client_exe: Path) -> None:
         f"GRANT ALL PRIVILEGES ON *.* TO '{ADMIN_USER}'@'localhost' WITH GRANT OPTION;"
         "FLUSH PRIVILEGES;"
     )
-    run_sql(client_exe, "root", ROOT_PASSWORD, sql, host="localhost")
+    last_err = None
+    used_pw = ROOT_PASSWORD
+    for pw in (ROOT_PASSWORD, "", "root"):
+        try:
+            run_sql(client_exe, "root", pw, sql, host="localhost")
+            used_pw = pw
+            break
+        except RuntimeError as e:
+            last_err = e
+    else:
+        raise RuntimeError(f"以 root 连接失败（尝试密码 justsmart/空/root）：{last_err}")
+    if used_pw != ROOT_PASSWORD:
+        try:
+            run_sql(client_exe, "root", used_pw,
+                    f"ALTER USER 'root'@'localhost' IDENTIFIED BY '{root_esc}';",
+                    host="localhost")
+        except RuntimeError:
+            pass  # root 密码设置失败不阻塞安装
+    return used_pw
 
 
 def db_connection_test(client_exe: Path, user: str = ADMIN_USER,
@@ -993,48 +1122,118 @@ class InstallerApp:
 
         self.root.after(0, lambda: self.progress_var.set(80))
 
+        # 实例配置自愈：MSI 维护模式重装可能不生成 my.ini / 不初始化数据目录
+        self.update_status("检查实例配置 my.ini 与数据目录 ...")
+        install_dir = client_exe.parent.parent
+        my_ini = ensure_my_ini()
+        self.log(f"  my.ini：{my_ini}")
+        if not system_tables_present():
+            self.log("  数据目录未初始化，清理残留后执行 mariadb-install-db 引导系统表（可能需要 1~2 分钟）...")
+            n = clear_data_dir_keep(my_ini)
+            if n:
+                self.log(f"    已清理 {n} 个未完成的初始化残留（无 mysql 系统库，无用户数据）")
+            lines = bootstrap_system_tables(install_dir, my_ini)
+            for line in lines[-8:]:
+                if line:
+                    self.log(f"    {line}")
+            if system_tables_present():
+                self.log("  ✓ 系统表初始化完成")
+                err = grant_service_account_dbhome()
+                if err:
+                    self.log(f"  ⚠ 授予 NT SERVICE\\{SERVICE_NAME} 目录权限失败：{err}")
+                else:
+                    self.log(f"  ✓ 已授予服务账号 NT SERVICE\\{SERVICE_NAME} 目录权限")
+            else:
+                self.log("  ⚠ 系统表可能未完整初始化，继续尝试启动")
+        else:
+            self.log("  ✓ 数据目录已初始化")
+
         # 服务处理（停止状态将启动；运行状态下仅确认端口）
         self.handle_service()
         if not port_open(DB_PORT):
-            err_hint = (DATA_DIR / "*.err") if DATA_DIR.exists() else "<数据目录>/*.err"
-            raise RuntimeError(
-                f"服务 {SERVICE_NAME} 未能启动且端口 {DB_PORT} 不可连接，无法继续配置；"
-                f"请检查数据目录错误日志（{err_hint}），"
-                f"或在本机 CMD 执行 net start {SERVICE_NAME} 查看具体报错")
+            self.update_status("前台启动 mysqld，捕获启动报错 ...")
+            self.run_mysqld_console_diag()
+            time.sleep(2)
+            subprocess.run(["net", "start", SERVICE_NAME], capture_output=True,
+                           text=True, timeout=180,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if not wait_for_service() or not port_open(DB_PORT):
+                err_hint = (DATA_DIR / "*.err") if DATA_DIR.exists() else "<数据目录>/*.err"
+                raise RuntimeError(
+                    f"服务 {SERVICE_NAME} 未能启动且端口 {DB_PORT} 不可连接，无法继续配置；"
+                    f"请检查数据目录错误日志（{err_hint}），"
+                    f"或在本机 CMD 执行 net start {SERVICE_NAME} 查看具体报错")
 
         self.root.after(0, lambda: self.progress_var.set(85))
 
         # 强制 bind-address=0.0.0.0，允许任意地址连接
         self.update_status("配置 bind-address=0.0.0.0 ...")
-        my_ini = find_my_ini(client_exe.parent.parent)
-        if not my_ini:
-            self.log("⚠ 未找到 my.ini，无法修改 bind-address")
+        if set_bind_address(my_ini):
+            self.log(f"✓ 已更新 {my_ini} 中的 bind-address={BIND_ADDRESS}")
+            self.update_status("重启服务使 bind-address 生效 ...")
+            if restart_service():
+                self.log(f"✓ 服务重启成功，端口 {DB_PORT} 已监听 {BIND_ADDRESS}")
+            else:
+                raise RuntimeError("服务重启失败，bind-address 未生效")
         else:
-            try:
-                if set_bind_address(my_ini):
-                    self.log(f"✓ 已更新 {my_ini} 中的 bind-address={BIND_ADDRESS}")
-                    self.update_status("重启服务使 bind-address 生效 ...")
-                    if restart_service():
-                        self.log(f"✓ 服务重启成功，端口 {DB_PORT} 已监听 {BIND_ADDRESS}")
-                    else:
-                        raise RuntimeError("服务重启失败，bind-address 未生效")
-                else:
-                    self.log(f"✓ bind-address 已是 {BIND_ADDRESS}，无需修改")
-            except RuntimeError:
-                raise
-            except Exception as e:
-                raise RuntimeError(f"配置 bind-address 失败：{e}")
+            self.log(f"✓ bind-address 已是 {BIND_ADDRESS}，无需修改")
 
         self.root.after(0, lambda: self.progress_var.set(90))
 
         # 创建管理员账号
         self.update_status(f"创建管理员账号 {ADMIN_USER} ...")
         try:
-            create_admin_account(client_exe)
+            used_pw = create_admin_account(client_exe)
+            pw_note = f"（root 初始密码为空，已自动补设为 {ROOT_PASSWORD}）" if used_pw != ROOT_PASSWORD else ""
             self.log(f"✓ 管理员账号已创建：{ADMIN_USER}@'%' / {ADMIN_USER}@'localhost' "
-                     "（全部权限，允许远程连接）")
+                     f"（全部权限，允许远程连接）{pw_note}")
         except Exception as e:
             raise RuntimeError(f"创建管理员账号失败：{e}")
+
+    def run_mysqld_console_diag(self):
+        """前台启动 mysqld（--console）抓取启动报错并写日志，45s 后强制结束。"""
+        mysqld = DB_HOME / "bin" / "mysqld.exe"
+        if not mysqld.exists():
+            self.log("  （未找到 mysqld.exe，跳过前台诊断）")
+            return
+        self.log("  前台启动 mysqld（--console）抓取报错 ...")
+        out_lines: list[str] = []
+        try:
+            p = subprocess.Popen(
+                [str(mysqld), f"--defaults-file={DATA_DIR / 'my.ini'}", "--console"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                encoding="utf-8", errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception as e:
+            self.log(f"  ⚠ 前台启动 mysqld 失败：{e}")
+            return
+
+        def _reader():
+            try:
+                for line in p.stdout:
+                    out_lines.append(line.rstrip())
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_reader, daemon=True)
+        t.start()
+        t.join(timeout=45)
+        if t.is_alive():
+            subprocess.run(["taskkill", "/F", "/PID", str(p.pid)],
+                           capture_output=True, timeout=30,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            out_lines.append("(前台 mysqld 启动超过 45s 未自己退出，已强制结束)")
+        try:
+            p.wait(timeout=15)
+        except Exception:
+            pass
+        shown = [l for l in out_lines if l.strip()]
+        if shown:
+            self.log(f"  mysqld 前台启动输出（末 {min(len(shown), 20)} 行）：")
+            for line in shown[-20:]:
+                self.log(f"    {line.strip()}")
+        else:
+            self.log("  （mysqld 前台无任何输出即退出——建议检查 .err 日志）")
 
     def handle_service(self):
         try:
