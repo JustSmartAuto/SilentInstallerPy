@@ -12,6 +12,7 @@
 """
 
 import os
+import json
 import re
 import socket
 import subprocess
@@ -19,7 +20,9 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -39,6 +42,143 @@ ADMIN_USER = "justsmart"
 ADMIN_PASSWORD = "justsmart"
 ROOT_PASSWORD = "justsmart"
 BIND_ADDRESS = "0.0.0.0"
+
+WEB_PORT_BASE = 18306  # 日志网页起始端口（冲突自动 +1 尝试）
+WEB_LOG_PAGE = """<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>MariaDB 一键安装器 · 详细日志</title>
+<style>
+  body { margin:0; background:#111; color:#e8e8e8;
+         font-family: Consolas, "Microsoft YaHei UI", monospace; }
+  header { padding:10px 16px; background:#00365B; color:#fff;
+           font-family:"Microsoft YaHei UI"; position:sticky; top:0; }
+  header .sub { font-size:12px; color:#9fd0ff; }
+  #ctrl { padding:6px 16px; font-size:12px; font-family:"Microsoft YaHei UI"; color:#bbb;}
+  #log { padding:8px 16px; font-size:13px; line-height:1.5; white-space:pre-wrap;
+         word-break:break-all; }
+  #log .t { color:#7ec8ff; }
+  #log .err { color:#ff7a7a; }
+  #log .ok { color:#7be07b; }
+</style>
+</head>
+<body>
+<header><b>MariaDB 一键安装器 · 详细日志</b>
+<div class="sub">每秒自动追加刷新，本页只读 —— url：__URL__</div></header>
+<div id="ctrl"><label><input type="checkbox" id="auto" checked> 自动滚动到底部</label></div>
+<div id="log"></div>
+<script>
+let after = 0;
+const logEl = document.getElementById('log');
+const auto = document.getElementById('auto');
+function cls(t){ if(t.includes('✗')||t.includes('失败')||t.includes('错误')) return 'err';
+                 if(t.includes('✓')||t.includes('成功')) return 'ok'; return ''; }
+function esc(s){ const d=document.createElement('div'); d.textContent=s; return d; }
+async function poll(){
+  try {
+    const r = await fetch('/logs?after=' + after);
+    if (r.ok) {
+      const arr = await r.json();
+      for (const e of arr) {
+        const div = document.createElement('div');
+        div.className = cls(e.text);
+        div.appendChild(esc(e.text));
+        logEl.appendChild(div);
+        after = e.seq;
+      }
+      if (arr.length && auto.checked) window.scrollTo(0, document.body.scrollHeight);
+    }
+  } catch (e) {}
+  setTimeout(poll, 1000);
+}
+poll();
+</script>
+</body>
+</html>
+"""
+
+
+class WebLogStore:
+    """线程安全的日志存储（按序号递增，供网页按 seq 增量拉取）。"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._entries = []
+
+    def append(self, text: str) -> int:
+        with self._lock:
+            seq = len(self._entries) + 1
+            self._entries.append({"seq": seq, "text": text})
+            return seq
+
+    def after(self, seq: int) -> list:
+        with self._lock:
+            return [e for e in self._entries if e["seq"] > seq]
+
+
+class LogRequestHandler(BaseHTTPRequestHandler):
+    store: WebLogStore = None  # type: ignore[assignment]
+
+    def do_GET(self):
+        try:
+            parts = urllib.parse.urlsplit(self.path)
+            if parts.path == "/" or parts.path == "/index.html":
+                body = WEB_LOG_PAGE.replace("__URL__", self.headers.get("Host", "")).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif parts.path == "/logs":
+                qs = urllib.parse.parse_qs(parts.query)
+                try:
+                    after = int((qs.get("after") or ["0"])[0])
+                except ValueError:
+                    after = 0
+                entries = self.store.after(after)
+                body = json.dumps(entries, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(404)
+                self.end_headers()
+        except Exception:
+            pass
+
+    def log_message(self, fmt, *args):  # 静默访问日志
+        pass
+
+
+def lan_ip() -> str:
+    """取局域网 IP（UDP connect 法，不发数据）。"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("192.168.255.255", 65535))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except OSError:
+        return "127.0.0.1"
+
+
+def start_web_log_server(store: WebLogStore) -> tuple[str, int] | None:
+    """在高端口启动日志网页服务（0.0.0.0，可远程查看）；失败返回 None。"""
+    for port in range(WEB_PORT_BASE, WEB_PORT_BASE + 40):
+        try:
+            httpd = ThreadingHTTPServer(("0.0.0.0", port), LogRequestHandler)
+            httpd.daemon_threads = True
+            LogRequestHandler.store = store
+            threading.Thread(target=httpd.serve_forever, daemon=True).start()
+            return lan_ip(), port
+        except OSError:
+            continue
+    return None
 
 
 def default_db_home() -> Path:
@@ -422,6 +562,11 @@ class InstallerApp:
         self.is_busy = False
         self.temp_dir = Path(tempfile.gettempdir()) / "mariadb-installer"
 
+        # 详细日志网页服务（高端口，可从其他机器远程查看）
+        self.web_log = WebLogStore()
+        self.web_addr = start_web_log_server(self.web_log)
+        self._web_browser = None
+
         try:
             icon = bundle_dir() / "app_icon.ico"
             if icon.exists():
@@ -431,6 +576,7 @@ class InstallerApp:
 
         self._build_ui()
         self.refresh_status()
+        self._announce_web_log()
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -442,6 +588,11 @@ class InstallerApp:
         tk.Label(header, text=f"安装器 v{CURRENT_VERSION}  |  内嵌 MariaDB "
                               f"{MARIADB_VERSION} (MSI)",
                  font=("Microsoft YaHei UI", 9), fg="lightgray", bg="#00365B").place(x=20, y=50)
+        self.web_label = tk.Label(header, text="详细日志网页：启动中...",
+                                  font=("Microsoft YaHei UI", 9, "bold"),
+                                  fg="#7ec8ff", bg="#00365B", cursor="hand2")
+        self.web_label.place(x=20, y=68)
+        self.web_label.bind("<Button-1>", lambda _e: self._open_web_url())
 
         # 组件状态区
         comp = tk.LabelFrame(self.root, text=" 组件检测（√ = 已安装，可选中后重装）",
@@ -640,95 +791,106 @@ class InstallerApp:
             raise RuntimeError(f"内嵌 MariaDB 安装包缺失（assets/{MSI_GLOB}）")
         msi_path = msis[0]
 
-        if self.db_installed and self.db_existing_client and \
-                service_exists():
-            self.log("已存在 MariaDB 服务，跳过重复安装")
-            return
+        client_exe = find_client_exe()
+        already_installed = bool(self.db_installed and client_exe and service_exists())
+        if already_installed:
+            self.log("已安装 MariaDB，跳过重复安装，执行服务/配置/账号自检 ...")
+        else:
+            # 不完整安装自愈：有服务端残留但没有 mysql.exe 客户端（如只装了
+            # MYSQLSERVER 父 Feature 而未装 Client/DBInstance 子 Feature），
+            # 先静默卸载残留，再按完整 Feature 列表重装
+            partial_server = (DB_HOME / "bin" / "mariadbd.exe").exists()
+            if not self.db_existing_client and partial_server:
+                self.log("检测到不完整的 MariaDB 安装（缺少客户端/实例配置），正在清理 ...")
+                self.temp_dir.mkdir(parents=True, exist_ok=True)
+                r_un = subprocess.run(
+                    ["msiexec", "/x", str(msi_path), "/qn", "/norestart",
+                     "/L*v", str(self.temp_dir / "mariadb-uninstall.log")],
+                    capture_output=True, text=True, timeout=900,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                if r_un.returncode == 0:
+                    self.log("✓ 残留卸载完成")
+                    n = remove_empty_tree(DB_HOME)
+                    if DB_HOME.exists() and any(DB_HOME.iterdir()):
+                        raise RuntimeError(
+                            f"残留清理后 {DB_HOME} 仍存在文件，MSI 无法安装进非空目录；"
+                            "请确认无重要数据后手动删除该目录再安装")
+                    if n:
+                        self.log(f"✓ 已清理 {n} 个空目录残留")
+                    self.log("开始重新安装")
+                else:
+                    self.log(f"⚠ 旧包卸载返回码 {r_un.returncode}（未安装则可忽略），继续安装 ...")
 
-        # 不完整安装自愈：有服务端残留但没有 mysql.exe 客户端（如只装了
-        # MYSQLSERVER 父 Feature 而未装 Client/DBInstance 子 Feature），
-        # 先静默卸载残留，再按完整 Feature 列表重装
-        partial_server = (DB_HOME / "bin" / "mariadbd.exe").exists()
-        if not self.db_existing_client and partial_server:
-            self.log("检测到不完整的 MariaDB 安装（缺少客户端/实例配置），正在清理 ...")
-            self.temp_dir.mkdir(parents=True, exist_ok=True)
-            r_un = subprocess.run(
-                ["msiexec", "/x", str(msi_path), "/qn", "/norestart",
-                 "/L*v", str(self.temp_dir / "mariadb-uninstall.log")],
-                capture_output=True, text=True, timeout=900,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            if r_un.returncode == 0:
-                self.log("✓ 残留卸载完成")
-                n = remove_empty_tree(DB_HOME)
+            # 安装前检查：MSI 拒绝安装进已存在的非空 INSTALLDIR；
+            # 若仅剩空目录残留（无任何文件）则自动清理
+            if not self.db_existing_client and DB_HOME.exists() and any(DB_HOME.iterdir()):
+                remove_empty_tree(DB_HOME)
                 if DB_HOME.exists() and any(DB_HOME.iterdir()):
                     raise RuntimeError(
-                        f"残留清理后 {DB_HOME} 仍存在文件，MSI 无法安装进非空目录；"
+                        f"安装目录 {DB_HOME} 已存在且有内容，MSI 拒绝安装（1603）；"
                         "请确认无重要数据后手动删除该目录再安装")
-                if n:
-                    self.log(f"✓ 已清理 {n} 个空目录残留")
-                self.log("开始重新安装")
-            else:
-                self.log(f"⚠ 旧包卸载返回码 {r_un.returncode}（未安装则可忽略），继续安装 ...")
 
-        # 安装前检查：MSI 拒绝安装进已存在的非空 INSTALLDIR；
-        # 若仅剩空目录残留（无任何文件）则自动清理
-        if not self.db_existing_client and DB_HOME.exists() and any(DB_HOME.iterdir()):
-            remove_empty_tree(DB_HOME)
-            if DB_HOME.exists() and any(DB_HOME.iterdir()):
-                raise RuntimeError(
-                    f"安装目录 {DB_HOME} 已存在且有内容，MSI 拒绝安装（1603）；"
-                    "请确认无重要数据后手动删除该目录再安装")
+            # 无 D 盘时回退 %APPDATA%/MariaDB（目录由 MSI 自动创建，不可预先创建：
+            # MSI 要求全新安装时 INSTALLDIR 不存在，否则返回 1603）
+            fallback_tag = "（无 D 盘，回退到 %APPDATA%/MariaDB）" if not Path("D:/").exists() else ""
+            self.log(f"数据库目录：{DB_HOME}{fallback_tag}")
 
-        # 无 D 盘时回退 %APPDATA%/MariaDB（目录由 MSI 自动创建，不可预先创建：
-        # MSI 要求全新安装时 INSTALLDIR 不存在，否则返回 1603）
-        fallback_tag = "（无 D 盘，回退到 %APPDATA%/MariaDB）" if not Path("D:/").exists() else ""
-        self.log(f"数据库目录：{DB_HOME}{fallback_tag}")
+            self.temp_dir.mkdir(parents=True, exist_ok=True)
+            msi_log = self.temp_dir / "mariadb-install.log"
+            self.log(f"运行内嵌安装包：{msi_path.name}（msiexec /qn 静默安装，请批准 UAC 提示）")
+            cmd = ["msiexec", "/i", str(msi_path), "/qn", "/norestart",
+                   "/L*v", str(msi_log),
+                   "ADDLOCAL=MYSQLSERVER,Client,SharedClientServerComponents,DBInstance,Backup",
+                   f"INSTALLDIR={DB_HOME}",
+                   f"DATADIR={DATA_DIR}",
+                   f"PORT={DB_PORT}",
+                   f"PASSWORD={ROOT_PASSWORD}",
+                   f"SERVICENAME={SERVICE_NAME}",
+                   "INSTALLSERVICE=1",
+                   "MODIFYROOTPASSWORD=1",
+                   "ENABLENETWORKING=1"]
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=1800)
+            if r.returncode != 0:
+                detail = (r.stderr or r.stdout or "").strip()
+                if not detail:
+                    detail = extract_msi_log_errors(msi_log)
+                if r.returncode == 1603:
+                    detail = detail or "（详见 MSI 日志）"
+                    detail += " | 常见原因：安装目录已存在且有内容、旧服务未卸载、UAC 被拒绝"
+                raise RuntimeError(f"MariaDB MSI 返回码 {r.returncode}：{detail}")
 
-        self.temp_dir.mkdir(parents=True, exist_ok=True)
-        msi_log = self.temp_dir / "mariadb-install.log"
-        self.log(f"运行内嵌安装包：{msi_path.name}（msiexec /qn 静默安装，请批准 UAC 提示）")
-        cmd = ["msiexec", "/i", str(msi_path), "/qn", "/norestart",
-               "/L*v", str(msi_log),
-               "ADDLOCAL=MYSQLSERVER,Client,SharedClientServerComponents,DBInstance,Backup",
-               f"INSTALLDIR={DB_HOME}",
-               f"DATADIR={DATA_DIR}",
-               f"PORT={DB_PORT}",
-               f"PASSWORD={ROOT_PASSWORD}",
-               f"SERVICENAME={SERVICE_NAME}",
-               "INSTALLSERVICE=1",
-               "MODIFYROOTPASSWORD=1",
-               "ENABLENETWORKING=1"]
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=1800)
-        if r.returncode != 0:
-            detail = (r.stderr or r.stdout or "").strip()
-            if not detail:
-                detail = extract_msi_log_errors(msi_log)
-            if r.returncode == 1603:
-                detail = detail or "（详见 MSI 日志）"
-                detail += " | 常见原因：安装目录已存在且有内容、旧服务未卸载、UAC 被拒绝"
-            raise RuntimeError(f"MariaDB MSI 返回码 {r.returncode}：{detail}")
+            # 兜底自动创建目录（MSI 完成后仍缺目录时补齐，含回退路径）
+            try:
+                ensure_dirs()
+                self.log(f"✓ 目录就绪：{DB_HOME} / {DATA_DIR}")
+            except Exception as e:
+                self.log(f"⚠ 目录兜底创建异常：{e}")
+
+            client_exe = find_client_exe()
+            if not client_exe:
+                raise RuntimeError("MariaDB 安装后未找到 mysql.exe 客户端")
+
         self.root.after(0, lambda: self.progress_var.set(70))
 
-        # 兜底自动创建目录（MSI 完成后仍缺目录时补齐，含回退路径）
-        try:
-            ensure_dirs()
-            self.log(f"✓ 目录就绪：{DB_HOME} / {DATA_DIR}")
-        except Exception as e:
-            self.log(f"⚠ 目录兜底创建异常：{e}")
-
-        client_exe = find_client_exe()
-        if not client_exe:
-            raise RuntimeError("MariaDB 安装后未找到 mysql.exe 客户端")
         ver = get_version(client_exe)
-        self.log(f"✓ MariaDB 安装成功：{ver or '未知版本'}")
+        if already_installed:
+            self.log(f"✓ MariaDB 已就绪：{ver or '未知版本'}")
+        else:
+            self.log(f"✓ MariaDB 安装成功：{ver or '未知版本'}")
         self.log(f"  安装目录：{client_exe.parent.parent}")
         self.log(f"  数据目录：{DATA_DIR}")
 
         self.root.after(0, lambda: self.progress_var.set(80))
 
-        # 服务处理
+        # 服务处理（停止状态将启动；运行状态下仅确认端口）
         self.handle_service()
+        if not port_open(DB_PORT):
+            err_hint = (DATA_DIR / "*.err") if DATA_DIR.exists() else "<数据目录>/*.err"
+            raise RuntimeError(
+                f"服务 {SERVICE_NAME} 未能启动且端口 {DB_PORT} 不可连接，无法继续配置；"
+                f"请检查数据目录错误日志（{err_hint}），"
+                f"或在本机 CMD 执行 net start {SERVICE_NAME} 查看具体报错")
 
         self.root.after(0, lambda: self.progress_var.set(85))
 
@@ -799,9 +961,33 @@ class InstallerApp:
         self.root.after(0, lambda: self.status_label.config(text=msg))
         self.log(msg)
 
+    def _announce_web_log(self):
+        if self.web_addr:
+            ip, port = self.web_addr
+            self.web_label.config(text=f"详细日志网页：http://127.0.0.1:{port}  "
+                                       f"（局域网 http://{ip}:{port}）")
+            self._web_browser = f"http://127.0.0.1:{port}"
+            self.log(f"详细日志网页已开启：http://127.0.0.1:{port}（同网段可访问 "
+                     f"http://{ip}:{port}，每秒追加刷新）")
+        else:
+            self.web_label.config(text="详细日志网页：端口占用失败（仅界面日志）")
+            self._web_browser = None
+
+    def _open_web_url(self):
+        if not self._web_browser:
+            return
+        try:
+            subprocess.Popen(["cmd", "/c", "start", "", self._web_browser],
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception as e:
+            self.log(f"⚠ 打开网页失败：{e}")
+
     def log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S")
-        self.root.after(0, lambda: self._append(f"[{ts}] {msg}\n"))
+        text = f"[{ts}] {msg}"
+        self.root.after(0, lambda: self._append(text + "\n"))
+        if self.web_log:
+            self.web_log.append(text)
 
     def _append(self, text: str):
         self.log_text.config(state=tk.NORMAL)
