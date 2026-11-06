@@ -3,6 +3,7 @@
 *.dll
 *.zip
 *.i64
+*.msi
 
 # 构建输出
 build/
