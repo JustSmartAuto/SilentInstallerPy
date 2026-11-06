@@ -14,6 +14,7 @@
 import os
 import json
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -505,6 +506,57 @@ def remove_empty_tree(root: Path) -> int:
     return removed
 
 
+def kill_zombie_processes_home() -> int:
+    """强杀可执行路径位于 DB_HOME 之下的进程（僵尸 mysqld 等），返回强杀数。
+
+    仅按路径匹配，不影响系统里其他位置的 MySQL/MariaDB 实例。
+    """
+    if sys.platform != "win32" or not DB_HOME.exists():
+        return 0
+    pattern = str(DB_HOME).rstrip("\\") + "\\*"
+    ps_script = (
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8;"
+        "Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like "
+        f"'{pattern}' }} | ForEach-Object {{ Write-Output "
+        "($_.ProcessId.ToString() + '|' + $_.Name) }"
+    )
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps_script],
+                           capture_output=True, text=True, timeout=90,
+                           encoding="utf-8", errors="replace",
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:
+        return 0
+    killed = 0
+    for line in (r.stdout or "").splitlines():
+        pid_s, _, name = line.strip().partition("|")
+        if not pid_s.strip().isdigit():
+            continue
+        try:
+            rk = subprocess.run(["taskkill", "/F", "/PID", pid_s.strip()],
+                                capture_output=True, text=True, timeout=30,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if rk.returncode == 0:
+                killed += 1
+        except Exception:
+            continue
+    return killed
+
+
+def force_wipe_home() -> bool:
+    """强杀占用进程后强制清空 DB_HOME 整个目录。成功（不存在/已清空）返回 True。"""
+    if not DB_HOME.exists():
+        return True
+    killed = kill_zombie_processes_home()
+    time.sleep(1)
+    try:
+        shutil.rmtree(DB_HOME, ignore_errors=False)
+        return True
+    except Exception:
+        shutil.rmtree(DB_HOME, ignore_errors=True)
+        return not DB_HOME.exists()
+
+
 def wait_for_service(timeout: float = SERVICE_START_TIMEOUT) -> bool:
     """等待服务进入 RUNNING 且端口可连接。"""
     t0 = time.monotonic()
@@ -812,9 +864,12 @@ class InstallerApp:
                     self.log("✓ 残留卸载完成")
                     n = remove_empty_tree(DB_HOME)
                     if DB_HOME.exists() and any(DB_HOME.iterdir()):
-                        raise RuntimeError(
-                            f"残留清理后 {DB_HOME} 仍存在文件，MSI 无法安装进非空目录；"
-                            "请确认无重要数据后手动删除该目录再安装")
+                        self.log("目录仍非空（可能被僵尸进程占用），强制结束进程并清空 ...")
+                        if force_wipe_home():
+                            self.log(f"✓ 已强制清空 {DB_HOME}")
+                        else:
+                            raise RuntimeError(
+                                f"{DB_HOME} 中仍有文件被占用无法删除，请重启机器后重新安装")
                     if n:
                         self.log(f"✓ 已清理 {n} 个空目录残留")
                     self.log("开始重新安装")
@@ -822,13 +877,16 @@ class InstallerApp:
                     self.log(f"⚠ 旧包卸载返回码 {r_un.returncode}（未安装则可忽略），继续安装 ...")
 
             # 安装前检查：MSI 拒绝安装进已存在的非空 INSTALLDIR；
-            # 若仅剩空目录残留（无任何文件）则自动清理
+            # 若仅剩空目录残留（无任何文件）则自动清理；有文件则强杀占用后强制清空
             if not self.db_existing_client and DB_HOME.exists() and any(DB_HOME.iterdir()):
                 remove_empty_tree(DB_HOME)
                 if DB_HOME.exists() and any(DB_HOME.iterdir()):
-                    raise RuntimeError(
-                        f"安装目录 {DB_HOME} 已存在且有内容，MSI 拒绝安装（1603）；"
-                        "请确认无重要数据后手动删除该目录再安装")
+                    self.log(f"安装目录 {DB_HOME} 非空（可能被僵尸进程占用），强制清空 ...")
+                    if force_wipe_home():
+                        self.log(f"✓ 已强制清空 {DB_HOME}")
+                    else:
+                        raise RuntimeError(
+                            f"{DB_HOME} 中仍有文件被占用无法删除，请重启机器后重新安装")
 
             # 无 D 盘时回退 %APPDATA%/MariaDB（目录由 MSI 自动创建，不可预先创建：
             # MSI 要求全新安装时 INSTALLDIR 不存在，否则返回 1603）
@@ -952,6 +1010,18 @@ class InstallerApp:
             if wait_for_service():
                 self.log(f"✓ 服务 {SERVICE_NAME} 启动成功，端口 {DB_PORT} 可连接")
             else:
+                # 端口打不开常见原因：僵尸 mysqld 占着端口（服务 SCM 状态与
+                # 实际进程不一致）。强杀本安装目录下的残留进程后再试一次
+                n_kill = kill_zombie_processes_home()
+                if n_kill:
+                    self.log(f"  强制结束了 {n_kill} 个占用进程，重试启动服务 ...")
+                    time.sleep(2)
+                    subprocess.run(["net", "start", SERVICE_NAME], capture_output=True,
+                                   text=True, timeout=180,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    if wait_for_service():
+                        self.log(f"✓ 服务 {SERVICE_NAME} 启动成功，端口 {DB_PORT} 可连接")
+                        return
                 self.log(f"⚠ 服务未确认运行，可手动执行 net start {SERVICE_NAME}")
         except Exception as e:
             self.log(f"⚠ 服务处理异常：{e}")
