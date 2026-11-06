@@ -1129,13 +1129,29 @@ class InstallerApp:
         self.log(f"  my.ini：{my_ini}")
         if not system_tables_present():
             self.log("  数据目录未初始化，清理残留后执行 mariadb-install-db 引导系统表（可能需要 1~2 分钟）...")
+            # install-db 要求 datadir 完全为空：my.ini 先挪出数据目录暂存，
+            # 引导完成后再放回（服务的 --defaults-file 指向数据目录内）
+            stash = DB_HOME / "my.ini.stash"
+            try:
+                my_ini.replace(stash)
+            except OSError:
+                stash = None
             n = clear_data_dir_keep(my_ini)
+            if not DATA_DIR.exists():
+                DATA_DIR.mkdir(parents=True, exist_ok=True)
             if n:
                 self.log(f"    已清理 {n} 个未完成的初始化残留（无 mysql 系统库，无用户数据）")
             lines = bootstrap_system_tables(install_dir, my_ini)
             for line in lines[-8:]:
                 if line:
                     self.log(f"    {line}")
+            if stash and stash.exists():
+                try:
+                    shutil.copy2(stash, DATA_DIR / "my.ini")
+                    stash.unlink()
+                    self.log("    已把 my.ini 放回数据目录")
+                except Exception as e:
+                    self.log(f"    ⚠ my.ini 放回失败：{e}")
             if system_tables_present():
                 self.log("  ✓ 系统表初始化完成")
                 err = grant_service_account_dbhome()
