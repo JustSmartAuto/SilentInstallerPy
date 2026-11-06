@@ -20,6 +20,8 @@ def prepare_assets(assets_dir: Path, project_root: Path) -> None:
         (project_root / "assets" / "mariadb-13.0.2-winx64.msi",
          "mariadb-13.0.2-winx64.msi"),
         (project_root / "assets" / "mariadb.ico", "app_icon.ico"),
+        (project_root / "assets" / "mariadb_data_13.0.2.zip",
+         "mariadb_data_13.0.2.zip"),
     ]
     for src, name in pairs:
         dst = assets_dir / name
