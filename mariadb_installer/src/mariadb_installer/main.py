@@ -476,13 +476,14 @@ def port_open(port: int, host: str = "", timeout: float = 2.0) -> bool:
 
 
 def run_sql(client_exe: Path, user: str, password: str, sql: str,
-            port: int = DB_PORT, host: str = "127.0.0.1") -> str:
+            port: int = DB_PORT, host: str = "127.0.0.1",
+            timeout: float | None = None) -> str:
     """用 mysql.exe 客户端执行 SQL，返回 stdout；失败抛出异常。"""
     cmd = [str(client_exe),
            "--host", host,
            "--port", str(port),
            "--user", user,
-           "--password", password,
+           f"--password={password}",  # 空格分隔会让 mysql.exe 挂死等待控制台输入
            "--connect-timeout", "15",
            "--protocol", "TCP",
            "--default-character-set", "utf8mb4",
@@ -490,10 +491,10 @@ def run_sql(client_exe: Path, user: str, password: str, sql: str,
     try:
         r = subprocess.run(cmd, capture_output=True, text=True,
                            encoding="utf-8", errors="replace",
-                           timeout=CLIENT_CMD_TIMEOUT,
+                           timeout=timeout or CLIENT_CMD_TIMEOUT,
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except subprocess.TimeoutExpired:
-        raise RuntimeError(f"SQL 执行超时（{CLIENT_CMD_TIMEOUT:.0f}s）：{sql}")
+        raise RuntimeError(f"SQL 执行超时（{timeout or CLIENT_CMD_TIMEOUT:.0f}s）：{sql}")
     out = r.stdout or ""
     err = r.stderr or ""
     if r.returncode != 0:
@@ -1385,9 +1386,9 @@ class InstallerApp:
         else:
             self.log("  ✓ 数据目录已初始化")
 
-        # 服务处理（停止状态将启动；运行状态下仅确认端口）
-        self.handle_service()
-        if not port_open(DB_PORT):
+        # 服务处理（停止状态将启动；运行状态下直接验证登录，端口探测只作兜底）
+        self.handle_service(client_exe)
+        if not (self.verify_login_brief(client_exe) or port_open(DB_PORT)):
             # 先尝试终极自愈（重建数据目录再引导）
             if not self.reset_data_and_bootstrap(client_exe):
                 self.update_status("前台启动 mysqld，捕获启动报错 ...")
@@ -1396,7 +1397,7 @@ class InstallerApp:
             subprocess.run(["net", "start", SERVICE_NAME], capture_output=True,
                            text=True, timeout=180,
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            if not wait_for_service() or not port_open(DB_PORT):
+            if not (self.verify_login_brief(client_exe) or port_open(DB_PORT)):
                 self.dump_failure_diagnostics("服务未能启动")
                 err_hint = (DATA_DIR / "*.err") if DATA_DIR.exists() else "<数据目录>/*.err"
                 raise RuntimeError(
@@ -1420,10 +1421,10 @@ class InstallerApp:
 
         self.root.after(0, lambda: self.progress_var.set(90))
 
-        # 创建管理员账号（先确认端口可连，避免对僵尸进程徒劳超时）
-        if not port_open(DB_PORT):
+        # 创建管理员账号（ghost 装载的账号通常已存在，此步幂等校验）
+        if not (self.verify_login_brief(client_exe) or port_open(DB_PORT)):
             raise RuntimeError(
-                f"端口 {DB_PORT} 不可连接，跳过建号；请重跑安装器触发终极自愈（重建数据目录）")
+                f"数据不可登录且端口 {DB_PORT} 不可连接，跳过建号；请重跑安装器触发终极自愈")
         self.update_status(f"创建管理员账号 {ADMIN_USER} ...")
         try:
             used_pw = create_admin_account(client_exe, self.log)
@@ -1479,17 +1480,28 @@ class InstallerApp:
         else:
             self.log("  （mysqld 前台无任何输出即退出——建议检查 .err 日志）")
 
-    def handle_service(self):
+    def handle_service(self, client_exe=None):
+        """服务处置：先启动/确认健康，随后若能直接登录数据库即判定成功。
+
+        登录验证是最高判据（本机端口探测在部分机器上被杀软/代理拦截失真）；
+        只有登录、端口双重不合时才进入杀进程/重构等激进手段。
+        """
         try:
             if service_is_running():
+                if client_exe and self.verify_login_brief(client_exe):
+                    self.log(f"✓ 服务 {SERVICE_NAME} 正在运行，数据库可登录")
+                    return
                 if port_open(DB_PORT):
                     self.log(f"✓ 服务 {SERVICE_NAME} 正在运行，端口 {DB_PORT} 可连接")
-                else:
-                    self.log("服务运行中，等待端口就绪 ...")
-                    if wait_for_service():
-                        self.log(f"✓ 端口 {DB_PORT} 就绪")
-                    else:
-                        self.log(f"⚠ 服务运行中但端口 {DB_PORT} 未就绪")
+                    return
+                self.log("服务运行中，等待端口就绪 ...")
+                if wait_for_service():
+                    self.log(f"✓ 端口 {DB_PORT} 就绪")
+                    return
+                if client_exe and self.verify_login_brief(client_exe):
+                    self.log("✓ 端口探测失真但数据库可登录，按健康处理")
+                    return
+                self.log(f"⚠ 服务运行中但端口 {DB_PORT} 未就绪")
                 return
             if service_exists():
                 self.log("\n服务已注册但未运行，正在启动 ...")
@@ -1501,6 +1513,9 @@ class InstallerApp:
                     self.log(f"  {out[-1]}")
             else:
                 self.log("\n未检测到 Windows 服务，静默安装应已注册 ...")
+                return
+            if client_exe and self.verify_login_brief(client_exe):
+                self.log(f"✓ 服务 {SERVICE_NAME} 启动成功，数据库可登录")
                 return
             if wait_for_service():
                 self.log(f"✓ 服务 {SERVICE_NAME} 启动成功，端口 {DB_PORT} 可连接")
@@ -1548,8 +1563,27 @@ class InstallerApp:
         except Exception as e:
             self.log(f"⚠ 服务处理异常：{e}")
 
+    def verify_login_brief(self, client_exe) -> bool:
+        """直接用数据库登录验证（多宿主原始方式，每个宿主最多等 5s）。
+
+        本机端口探测在部分机器上被杀软/代理拦截而失真，
+        以"MySQL 客户端能否登录"作为服务健康的最高判据。
+        成功返回 True；失败返回 False（不抛异常）。
+        """
+        for host in ["127.0.0.1", "localhost"] + all_local_ips():
+            try:
+                run_sql(client_exe, ADMIN_USER, ADMIN_PASSWORD,
+                        "SELECT 1;", host=host, timeout=5.0)
+                self.log(f"  ✓ 数据库登录验证通过：host={host} "
+                         f"账号={ADMIN_USER} 端口={DB_PORT}")
+                return True
+            except RuntimeError as e:
+                self.log(f"    宿主 {host} 登录失败：{str(e).splitlines()[-1][:100]}")
+            except Exception as e:
+                self.log(f"    宿主 {host} 登录失败：{e}")
+        return False
+
     def dump_failure_diagnostics(self, stage: str):
-        """失败现场取证：B.chomp 存活进程 + 最新 .err 末 30 行 + 核心文件可写性。"""
         try:
             self.log(f"\n【{stage}】失败诊断 ...")
             alives = home_processes_alive()
