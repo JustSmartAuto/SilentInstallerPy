@@ -96,20 +96,49 @@ def enumerate_dotnet_desktop_runtime_entries() -> list[dict]:
     返回 [{'version': str, 'product_code': str|None, 'display_name': str}]。
     兼容 DisplayName 形如 "Microsoft Windows Desktop Runtime - 6.0.25 (x64)"。
     """
+    return _enumerate_dotnet_entries(kind="desktop")
+
+
+def enumerate_dotnet_6_entries() -> list[dict]:
+    """枚举所有 .NET 6.0.x 组件条目（Desktop Runtime / .NET Runtime / ASP.NET Core / SDK）。
+
+    .NET Desktop Runtime 安装包内部捆绑了 .NET Runtime 与 ASP.NET Core Runtime
+    的 MSI；若系统存在更高版本的这些组件，安装 6.0.0 会返回 1638。
+    因此强制安装前需把所有 6.0.x（高于 6.0.0）的相关组件一并卸载。
+    """
+    return _enumerate_dotnet_entries(kind="all")
+
+
+def _enumerate_dotnet_entries(kind: str = "all") -> list[dict]:
+    """通用 .NET 卸载注册表枚举。
+
+    kind='desktop' 仅匹配 Windows Desktop Runtime；
+    kind='all'     匹配 Desktop Runtime / .NET Runtime / ASP.NET Core / SDK。
+    """
     if sys.platform != "win32":
         return []
     entries = []
     seen = set()
+    desktop_kw = "windows desktop runtime"
+    all_kws = (desktop_kw, ".net runtime", "asp.net core", ".net sdk")
     for sk, sub in _iter_uninstall_keys():
         with sk:
             name = _read_val(sk, "DisplayName")
             if not name:
                 continue
             name = str(name)
-            if "windows desktop runtime" not in name.lower():
-                continue
-            # 从 DisplayName 提取版本号，例如 "... - 6.0.25 (x64)"
-            m = re.search(r"-\s*(\d+\.\d+(?:\.\d+){0,3})", name)
+            nlow = name.lower()
+            if kind == "desktop":
+                if desktop_kw not in nlow:
+                    continue
+            else:
+                if not any(kw in nlow for kw in all_kws):
+                    continue
+            # 从 DisplayName 提取版本号，兼容多种写法：
+            #   "... - 6.0.25 (x64)"        （Desktop Runtime / .NET Runtime）
+            #   "ASP.NET Core 8.0.19 ..."    （ASP.NET Core，无短横线）
+            #   ".NET SDK 9.0.316 ..."       （SDK，无短横线）
+            m = re.search(r"(\d+\.\d+\.\d+(?:\.\d+)?)", name)
             version = m.group(1) if m else ""
             # ProductCode：key 若是 GUID 则直接用，否则从 UninstallString 提取
             product_code = None
@@ -175,20 +204,16 @@ def version_gt(a: str, b: str) -> bool:
     return parse_version(a) > parse_version(b)
 
 
-def find_dotnet_uninstall_product_code(version: str) -> str | None:
-    """从卸载注册表找到指定版本 .NET Desktop Runtime 的 ProductCode。"""
-    for e in enumerate_dotnet_desktop_runtime_entries():
-        if e["version"] == version and e["product_code"]:
-            return e["product_code"]
-    return None
+def uninstall_dotnet_version(version: str, log, scope: str = "all") -> bool:
+    """静默卸载指定版本的 .NET 组件（x86 与 x64 都卸载）。
 
-
-def uninstall_dotnet_desktop(version: str, log) -> bool:
-    """静默卸载指定版本的 .NET Desktop Runtime（x86 与 x64 都卸载）。
-
+    scope='desktop' 仅卸载 Windows Desktop Runtime；
+    scope='all'     卸载 Desktop Runtime / .NET Runtime / ASP.NET Core / SDK。
     成功卸载至少一个返回 True。
     """
-    codes = [e["product_code"] for e in enumerate_dotnet_desktop_runtime_entries()
+    src = (enumerate_dotnet_6_entries() if scope == "all"
+           else enumerate_dotnet_desktop_runtime_entries())
+    codes = [e["product_code"] for e in src
              if e["version"] == version and e["product_code"]]
     # 去重，保持顺序
     seen = set()
@@ -198,38 +223,43 @@ def uninstall_dotnet_desktop(version: str, log) -> bool:
         return False
     ok = False
     for code in codes:
-        log(f"  正在静默卸载 .NET Desktop Runtime {version}（{code}）...")
+        log(f"  正在静默卸载 .NET 组件 {version}（{code}）...")
         r = subprocess.run(
             ["msiexec.exe", "/x", code, "/qn", "/norestart",
-             f"/REBOOT=ReallySuppress"],
+             "REBOOT=ReallySuppress"],
             capture_output=True, text=True, timeout=600,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         # 0=成功 1605=产品未安装（已卸载） 3010=需重启
         if r.returncode in (0, 1605, 3010):
-            log(f"  ✓ 已卸载 .NET Desktop Runtime {version}")
+            log(f"  ✓ 已卸载 .NET 组件 {version}")
             ok = True
         else:
             log(f"  ✗ 卸载 {version} 返回码 {r.returncode}：{r.stderr or r.stdout}")
     return ok
 
 
-def uninstall_all_newer_dotnet_6(target: str, log) -> int:
-    """卸载所有版本高于 target 的 .NET 6 Desktop Runtime。返回卸载数量。"""
+def uninstall_all_newer_dotnet_6(target: str, log, scope: str = "all") -> int:
+    """卸载所有版本高于 target 的 .NET 6 组件。返回卸载数量。
+
+    scope='desktop' 仅处理 Desktop Runtime；scope='all' 处理所有 .NET 6 组件
+    （Desktop Runtime / .NET Runtime / ASP.NET Core / SDK），因为 Desktop Runtime
+    安装包捆绑了后两者的 MSI，高版本残留会导致 6.0.0 安装返回 1638。
+    """
     removed = 0
-    # 先从卸载注册表枚举，确保不漏掉 dotnet 注册表未登记的情况
-    entries = enumerate_dotnet_desktop_runtime_entries()
+    entries = (enumerate_dotnet_6_entries() if scope == "all"
+               else enumerate_dotnet_desktop_runtime_entries())
     for e in entries:
         v = e["version"]
         if not v:
             continue
         if parse_version(v)[:2] == (6, 0) and version_gt(v, target):
-            if uninstall_dotnet_desktop(v, log):
+            if uninstall_dotnet_version(v, log, scope=scope):
                 removed += 1
-    # 再用 dotnet 注册表兜底（版本可能不在卸载表显示名里）
+    # dotnet 注册表兜底（版本可能不在卸载表显示名里）
     for v in get_installed_dotnet_desktop_versions():
         if parse_version(v)[:2] == (6, 0) and version_gt(v, target):
             if v not in [e["version"] for e in entries]:
-                if uninstall_dotnet_desktop(v, log):
+                if uninstall_dotnet_version(v, log, scope="desktop"):
                     removed += 1
     return removed
 
@@ -277,13 +307,13 @@ def install_dotnet_desktop_6_0_0(log) -> None:
             [str(installer), "/quiet", "/norestart"],
             capture_output=True, text=True, timeout=1200,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        # 再次兜底：若仍 1638，卸载所有 6.0.x（含目标版本也先清掉再装）
+        # 再次兜底：若仍 1638，卸载全部 .NET 6.0.x 组件（含目标版本也先清掉再装）
         if r.returncode in (1638, 0x00000666, 0x80070666, -2147023258):
-            log("  仍失败，卸载全部 .NET 6.0.x Desktop Runtime 后再次重试 ...")
-            for e in enumerate_dotnet_desktop_runtime_entries():
+            log("  仍失败，卸载全部 .NET 6.0.x 组件（含 .NET Runtime / ASP.NET Core）后再次重试 ...")
+            for e in enumerate_dotnet_6_entries():
                 v = e["version"]
                 if v and parse_version(v)[:2] == (6, 0):
-                    uninstall_dotnet_desktop(v, log)
+                    uninstall_dotnet_version(v, log, scope="all")
             time.sleep(3)
             r = subprocess.run(
                 [str(installer), "/quiet", "/norestart"],
