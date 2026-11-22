@@ -1368,12 +1368,15 @@ class InstallerApp:
                     if line:
                         self.log(f"    {line}")
             if stash and stash.exists():
-                try:
-                    shutil.copy2(stash, DATA_DIR / "my.ini")
+                if ghost and (DATA_DIR / "my.ini").exists():
+                    stash.unlink()  # ghost 的 my.ini（bind=0.0.0.0）优先，stash 作废
+                else:
+                    try:
+                        shutil.copy2(stash, DATA_DIR / "my.ini")
+                        self.log("    已把暂存 my.ini 放回数据目录")
+                    except Exception as e:
+                        self.log(f"    ⚠ my.ini 放回失败：{e}")
                     stash.unlink()
-                    self.log("    已把 my.ini 放回数据目录")
-                except Exception as e:
-                    self.log(f"    ⚠ my.ini 放回失败：{e}")
             if system_tables_present():
                 self.log("  ✓ 系统表初始化完成")
                 err = grant_service_account_dbhome()
@@ -1642,11 +1645,14 @@ class InstallerApp:
                     if line:
                         self.log(f"    {line}")
             if stash and stash.exists():
-                try:
-                    shutil.copy2(stash, DATA_DIR / "my.ini")
+                if ghost and (DATA_DIR / "my.ini").exists():
+                    stash.unlink()  # ghost 的 my.ini 优先
+                else:
+                    try:
+                        shutil.copy2(stash, DATA_DIR / "my.ini")
+                    except Exception:
+                        pass
                     stash.unlink()
-                except Exception:
-                    pass
             if not system_tables_present():
                 self.log("    ⚠ 重建引导仍未成功")
                 return False

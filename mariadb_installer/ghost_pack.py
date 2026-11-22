@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """把本机(健康实例)的数据目录打包成嵌入资源 mariadb_data_13.0.2.zip。
 
-流程：停本机服务 -> 打 zip(排除 *.err/*.pid/my.ini/ibtmp1/ddl_recovery 日志) -> 重新启动本机服务。
+流程：停本机服务 -> 打 zip(排除 *.err/*.pid/ibtmp1/ddl_recovery 日志；my.ini 含 bind=0.0.0.0 一并打包，解包即就位免改配置) -> 重新启动本机服务。
 """
 import subprocess
 import zipfile
@@ -25,7 +25,7 @@ def run(*cmd):
 print("停止本机服务 ...")
 print(run("net", "stop", SERVICE).strip() or "(无输出)")
 
-EXCLUDE = {"*.err", "*.pid", "my.ini", "ibtmp1", "ddl_recovery.log",
+EXCLUDE = {"*.err", "*.pid", "ibtmp1", "ddl_recovery.log",
            "ddl_recovery-backup.log"}
 
 skip_start = False
