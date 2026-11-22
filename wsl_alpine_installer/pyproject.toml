@@ -1,6 +1,6 @@
 [project]
 name = "wsl-alpine-installer"
-version = "1.0.0"
+version = "1.1.0"
 description = "WSL2 Alpine Linux 一键离线静默安装器"
 requires-python = ">=3.10"
 dependencies = []

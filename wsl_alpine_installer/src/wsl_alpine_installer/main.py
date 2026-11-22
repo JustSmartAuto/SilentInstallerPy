@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -10,9 +11,11 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 APP_NAME = "WSL2 Alpine Linux 一键离线安装器"
-CURRENT_VERSION = "1.0.0"
+CURRENT_VERSION = "1.1.0"
 DISTRO_NAME = "Alpine"
 FEATURES = ("Microsoft-Windows-Subsystem-Linux", "VirtualMachinePlatform")
+RESUME_TASK_NAME = "WslAlpineInstallerResume"
+STATE_VERSION = 1
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
@@ -40,6 +43,45 @@ def bundle_dir() -> Path:
 def install_dir() -> Path:
     base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
     return base / "AlpineWSL" / DISTRO_NAME
+
+
+def state_dir() -> Path:
+    return install_dir().parent
+
+
+def state_path() -> Path:
+    return state_dir() / "installer-state.json"
+
+
+def load_resume_state() -> dict | None:
+    try:
+        data = json.loads(state_path().read_text(encoding="utf-8"))
+        if data.get("version") == STATE_VERSION and data.get("pending"):
+            return data
+    except (OSError, ValueError, TypeError):
+        pass
+    return None
+
+
+def save_resume_state(reinstall_alpine: bool):
+    target = state_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "version": STATE_VERSION,
+        "pending": True,
+        "reinstall_alpine": bool(reinstall_alpine),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    temporary = target.with_suffix(".tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(target)
+
+
+def clear_resume_state():
+    try:
+        state_path().unlink()
+    except FileNotFoundError:
+        pass
 
 
 def decode_output(data: bytes | None) -> str:
@@ -71,16 +113,50 @@ def command_output(result) -> str:
     )
 
 
-def distro_registered() -> bool:
-    try:
-        result = run_command(["wsl.exe", "--list", "--quiet"], timeout=20)
-        if result.returncode == 0:
-            names = [line.strip() for line in command_output(result).splitlines()]
-            if DISTRO_NAME.casefold() in (name.casefold() for name in names):
-                return True
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+def remove_resume_task():
+    run_command(
+        ["schtasks.exe", "/Delete", "/TN", RESUME_TASK_NAME, "/F"], timeout=30
+    )
 
+
+def schedule_resume_task():
+    identity_result = run_command(["whoami.exe"], timeout=15)
+    identity = command_output(identity_result).strip()
+    if identity_result.returncode != 0 or "\\" not in identity:
+        raise RuntimeError(f"无法确定当前 Windows 用户：{identity}")
+
+    if getattr(sys, "frozen", False):
+        executable = Path(sys.executable).resolve()
+        arguments = "--resume"
+    else:
+        executable = Path(sys.executable).resolve()
+        arguments = f'"{Path(__file__).resolve()}" --resume'
+    task_command = f'"{executable}" {arguments}'
+
+    result = run_command(
+        [
+            "schtasks.exe",
+            "/Create",
+            "/TN",
+            RESUME_TASK_NAME,
+            "/TR",
+            task_command,
+            "/SC",
+            "ONLOGON",
+            "/RU",
+            identity,
+            "/RL",
+            "HIGHEST",
+            "/IT",
+            "/F",
+        ],
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"创建重启续跑任务失败：{command_output(result)}")
+
+
+def distro_info() -> dict | None:
     base = r"Software\Microsoft\Windows\CurrentVersion\Lxss"
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, base) as key:
@@ -94,36 +170,92 @@ def distro_registered() -> bool:
                 try:
                     with winreg.OpenKey(key, subkey_name) as subkey:
                         name, _ = winreg.QueryValueEx(subkey, "DistributionName")
-                    if str(name).casefold() == DISTRO_NAME.casefold():
-                        return True
+                        if str(name).casefold() != DISTRO_NAME.casefold():
+                            continue
+                        info = {"DistributionName": str(name)}
+                        for value_name in ("Version", "State", "BasePath", "DefaultUid"):
+                            try:
+                                info[value_name], _ = winreg.QueryValueEx(subkey, value_name)
+                            except OSError:
+                                pass
+                        return info
                 except OSError:
                     continue
     except OSError:
         pass
-    return False
+    return None
 
 
-def verify_alpine(timeout: int = 60) -> str:
-    attempts = [["wsl.exe", "-d", DISTRO_NAME, "uname", "-a"]]
-    launcher = install_dir() / "Alpine.exe"
-    if launcher.is_file():
-        attempts.append([str(launcher), "run", "uname", "-a"])
+def distro_registered() -> bool:
+    return distro_info() is not None
 
-    errors = []
-    for command in attempts:
-        try:
-            result = run_command(
-                command,
-                timeout=timeout,
-                cwd=launcher.parent if launcher.parent.is_dir() else None,
-            )
-            output = command_output(result)
-            if result.returncode == 0 and "Linux" in output:
-                return output
-            errors.append(output or f"返回码 {result.returncode}")
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            errors.append(str(exc))
-    raise RuntimeError("uname -a 验证失败：" + "；".join(errors))
+
+def usage_text() -> str:
+    return (
+        "进入 Alpine（在 PowerShell 或 CMD 中执行）：\n"
+        "  wsl -d Alpine\n\n"
+        "退出 Alpine：\n"
+        "  exit"
+    )
+
+
+def verification_text(info: dict) -> str:
+    return (
+        f"Alpine 版本：{info.get('release', '未知')}\n"
+        "WSL 版本：2\n"
+        f"默认身份：{info.get('identity', '未知')}\n"
+        f"安装位置：{info.get('base_path', install_dir())}\n\n"
+        f"Linux 内核：{info.get('kernel', '未知')}\n\n"
+        f"{usage_text()}"
+    )
+
+
+def verify_alpine(timeout: int = 90) -> dict:
+    registered = distro_info()
+    if not registered:
+        raise RuntimeError("未在当前 Windows 用户下检测到 Alpine 发行版")
+    if int(registered.get("Version", 0) or 0) != 2:
+        raise RuntimeError("Alpine 已注册，但不是 WSL2")
+
+    command = [
+        "wsl.exe",
+        "-d",
+        DISTRO_NAME,
+        "-e",
+        "/bin/sh",
+        "-c",
+        "echo ALPINE_SHELL_OK; cat /etc/alpine-release; uname -a; id",
+    ]
+    try:
+        result = run_command(command, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Alpine Shell 验证超时") from exc
+    output = command_output(result)
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    release = next(
+        (line for line in lines if line and line[0].isdigit() and "Linux" not in line),
+        "未知",
+    )
+    kernel = next((line for line in lines if line.startswith("Linux")), "未知")
+    identity = next((line for line in lines if line.startswith("uid=")), "未知")
+    if (
+        result.returncode == 0
+        and "ALPINE_SHELL_OK" in output
+        and kernel.startswith("Linux")
+        and "WSL2" in kernel
+        and identity.startswith("uid=0(root)")
+    ):
+        return {
+            "output": output,
+            "release": release,
+            "kernel": kernel,
+            "identity": identity,
+            "base_path": registered.get("BasePath", str(install_dir())),
+        }
+    raise RuntimeError(
+        "Alpine 完整验证失败，需要同时确认 Alpine 版本、WSL2 内核和 root 身份：\n"
+        f"{output or f'返回码 {result.returncode}'}"
+    )
 
 
 class InstallerApp:
@@ -135,6 +267,11 @@ class InstallerApp:
         self.root.configure(bg="white")
         self.is_busy = False
         self.alpine_installed = False
+        self.resume_state = load_resume_state()
+        self.reboot_pending = self.resume_state is not None
+        self.reinstall_requested = bool(
+            self.resume_state and self.resume_state.get("reinstall_alpine", True)
+        )
 
         try:
             icon = bundle_dir() / "app_icon.ico"
@@ -145,6 +282,20 @@ class InstallerApp:
 
         self._build_ui()
         self.refresh_status()
+        if self.resume_state:
+            self.alpine_var.set(self.reinstall_requested or not self.alpine_installed)
+            self.status_label.config(text="检测到重启续装任务")
+        self.set_busy(False)
+
+        if "--resume" in sys.argv:
+            remove_resume_task()
+            if self.resume_state:
+                self.root.after(800, self.resume_install)
+            else:
+                self.root.after(
+                    200,
+                    lambda: messagebox.showinfo("没有续装任务", "没有检测到待继续的安装任务。"),
+                )
 
     def _build_ui(self):
         header = tk.Frame(self.root, bg="#176B87", height=90)
@@ -201,7 +352,7 @@ class InstallerApp:
 
         tk.Label(
             self.root,
-            text="自动启用 WSL 与虚拟机平台、安装内核更新，并在完成后执行 uname -a 验证。",
+            text="自动启用 WSL 与虚拟机平台、安装内核，并验证 Alpine、WSL2 和 root 登录。",
             font=("Microsoft YaHei UI", 9),
             fg="#A65D00",
             bg="white",
@@ -240,8 +391,8 @@ class InstallerApp:
         buttons.pack_propagate(False)
         self.test_btn = tk.Button(
             buttons,
-            text="验证 uname -a",
-            width=15,
+            text="验证安装",
+            width=14,
             bg="#107C10",
             fg="white",
             font=("Microsoft YaHei UI", 9, "bold"),
@@ -249,7 +400,7 @@ class InstallerApp:
             command=self.on_test,
             state=tk.DISABLED,
         )
-        self.test_btn.place(x=160, y=12)
+        self.test_btn.place(x=20, y=12)
         self.install_btn = tk.Button(
             buttons,
             text="开始安装",
@@ -260,7 +411,19 @@ class InstallerApp:
             relief=tk.FLAT,
             command=self.on_install,
         )
-        self.install_btn.place(x=305, y=12)
+        self.install_btn.place(x=150, y=12)
+        self.restart_btn = tk.Button(
+            buttons,
+            text="重启并继续",
+            width=14,
+            bg="#C0504D",
+            fg="white",
+            font=("Microsoft YaHei UI", 9, "bold"),
+            relief=tk.FLAT,
+            command=self.on_reboot,
+            state=tk.DISABLED,
+        )
+        self.restart_btn.place(x=290, y=12)
         tk.Button(
             buttons,
             text="重新检测",
@@ -301,12 +464,19 @@ class InstallerApp:
             fg="green" if self.alpine_installed else "red",
         )
         self.test_btn.config(state=tk.NORMAL if self.alpine_installed else tk.DISABLED)
+        self.set_busy(self.is_busy)
 
     def set_busy(self, busy: bool):
         self.is_busy = busy
-        state = tk.DISABLED if busy else tk.NORMAL
-        self.install_btn.config(state=state)
-        self.test_btn.config(state=state if self.alpine_installed else tk.DISABLED)
+        self.install_btn.config(
+            state=tk.DISABLED if busy or self.reboot_pending else tk.NORMAL
+        )
+        self.test_btn.config(
+            state=tk.NORMAL if not busy and self.alpine_installed else tk.DISABLED
+        )
+        self.restart_btn.config(
+            state=tk.NORMAL if not busy and self.reboot_pending else tk.DISABLED
+        )
 
     def on_test(self):
         if self.is_busy:
@@ -315,25 +485,23 @@ class InstallerApp:
 
         def worker():
             try:
-                output = verify_alpine()
-                self.log(f"验证成功：{output}")
+                info = verify_alpine()
+                self.log(f"验证成功：{info['output']}")
                 self.root.after(
                     0,
-                    lambda: messagebox.showinfo("验证成功", f"uname -a 输出：\n\n{output}"),
+                    lambda: messagebox.showinfo("验证成功", verification_text(info)),
                 )
             except Exception as exc:
                 message = str(exc)
                 self.log(f"验证失败：{message}")
-                self.root.after(
-                    0, lambda: messagebox.showerror("验证失败", message)
-                )
+                self.root.after(0, lambda: messagebox.showerror("验证失败", message))
             finally:
                 self.root.after(0, lambda: self.set_busy(False))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def on_install(self):
-        if self.is_busy:
+        if self.is_busy or self.reboot_pending:
             return
         if self.alpine_installed and not self.alpine_var.get():
             self.on_test()
@@ -345,13 +513,47 @@ class InstallerApp:
         )
         if not messagebox.askyesno(
             "确认安装",
-            "将离线启用 WSL2、安装内核更新和 Alpine Linux，最后执行 uname -a 验证。"
+            "将离线启用 WSL2、安装内核更新和 Alpine Linux，最后执行完整验证。"
             f"{warning}\n\n是否继续？",
         ):
             return
+        self.start_install()
+
+    def start_install(self):
+        self.reinstall_requested = self.alpine_var.get()
         self.set_busy(True)
         self.progress_var.set(0)
         threading.Thread(target=self.install_worker, daemon=True).start()
+
+    def resume_install(self):
+        if self.is_busy or not self.resume_state:
+            return
+        self.reinstall_requested = bool(self.resume_state.get("reinstall_alpine", True))
+        self.reboot_pending = False
+        self.alpine_var.set(self.reinstall_requested or not self.alpine_installed)
+        self.log("检测到重启续跑状态，自动继续剩余安装步骤。")
+        self.start_install()
+
+    def on_reboot(self):
+        if self.is_busy or not self.reboot_pending:
+            return
+        if not messagebox.askyesno(
+            "确认重启",
+            "现在重启 Windows 吗？\n\n请先保存其他程序的工作。重新登录后，安装器会自动以管理员权限打开并继续剩余步骤。",
+        ):
+            return
+        try:
+            save_resume_state(self.reinstall_requested or not self.alpine_installed)
+            schedule_resume_task()
+            self.log("重启续跑任务已创建，将在当前用户下次登录时自动运行。")
+            result = run_command(["shutdown.exe", "/r", "/t", "5"], timeout=15)
+            if result.returncode != 0:
+                raise RuntimeError(f"重启命令失败：{command_output(result)}")
+            self.root.destroy()
+        except Exception as exc:
+            message = str(exc)
+            self.log(f"无法重启：{message}")
+            messagebox.showerror("重启失败", message)
 
     def install_worker(self):
         try:
@@ -360,32 +562,45 @@ class InstallerApp:
             self.install_kernel()
             self.root.after(0, lambda: self.progress_var.set(45))
             self.set_default_wsl2()
-            if self.alpine_var.get() or not self.alpine_installed:
+            if self.reinstall_requested or not self.alpine_installed:
                 self.install_alpine()
             self.root.after(0, lambda: self.progress_var.set(85))
-            self.update_status("正在执行 uname -a 验证……")
-            output = verify_alpine()
-            self.log(f"✓ 验证成功：{output}")
+            self.update_status("正在验证 Alpine、WSL2 和 root 登录……")
+            info = verify_alpine()
+            self.log(f"✓ 完整验证成功：{info['output']}")
+            clear_resume_state()
+            remove_resume_task()
+            self.resume_state = None
+            self.reboot_pending = False
             self.root.after(0, lambda: self.progress_var.set(100))
             self.update_status("安装和验证全部完成")
             self.root.after(
                 0,
                 lambda: messagebox.showinfo(
-                    "安装完成", f"Alpine Linux 已通过 WSL 安装并验证。\n\nuname -a：\n{output}"
+                    "安装完成",
+                    "Alpine Linux 已通过 WSL2 安装并验证。\n\n"
+                    + verification_text(info),
                 ),
             )
         except RebootRequired as exc:
             message = str(exc)
+            self.reboot_pending = True
+            save_resume_state(self.reinstall_requested or not self.alpine_installed)
+            self.resume_state = load_resume_state()
             self.update_status("需要重启后继续")
             self.log(message)
             self.root.after(
                 0,
                 lambda: messagebox.showwarning(
-                    "需要重启", f"{message}\n\n重启后请重新运行本安装器，以继续安装并验证 Alpine。"
+                    "需要重启",
+                    f"{message}\n\n请点击“重启并继续”。重新登录后安装器会自动打开并完成剩余步骤。",
                 ),
             )
         except Exception as exc:
             message = str(exc)
+            clear_resume_state()
+            self.resume_state = None
+            self.reboot_pending = False
             self.update_status(f"安装失败：{message}")
             self.log(f"✗ 安装失败：{message}")
             self.root.after(0, lambda: messagebox.showerror("安装错误", message))
@@ -395,6 +610,7 @@ class InstallerApp:
 
     def enable_wsl_features(self):
         self.update_status("正在启用 WSL 和虚拟机平台……")
+        reboot_needed = False
         for feature in FEATURES:
             self.log(f"启用 Windows 功能：{feature}")
             result = run_command(
@@ -410,20 +626,35 @@ class InstallerApp:
                 timeout=600,
             )
             if result.returncode == 3010:
-                raise RebootRequired("Windows 功能已启用，必须重启后才能继续。")
+                reboot_needed = True
+                self.log(f"{feature} 已启用，等待统一重启。")
+                continue
             if result.returncode != 0:
                 raise RuntimeError(
                     f"启用 {feature} 失败（返回码 {result.returncode}）：{command_output(result)}\n"
                     "已使用 /LimitAccess 禁止 Windows Update。若系统提示找不到源文件，"
                     "说明本机组件存储缺少该功能负载，需要提供与 Windows 版本和语言完全匹配的离线源。"
                 )
+        if reboot_needed:
+            raise RebootRequired("Windows 功能已启用，必须重启后才能安装 WSL2 内核。")
         self.log("✓ WSL 和虚拟机平台已启用")
 
     def install_kernel(self):
         self.update_status("正在静默安装 WSL2 Linux 内核更新……")
         package = bundle_dir() / "wsl_update_x64.msi"
+        log_dir = state_dir() / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
         result = run_command(
-            ["msiexec.exe", "/i", str(package), "/qn", "/norestart"], timeout=900
+            [
+                "msiexec.exe",
+                "/i",
+                str(package),
+                "/qn",
+                "/norestart",
+                "/L*v",
+                str(log_dir / "wsl_update_install.log"),
+            ],
+            timeout=900,
         )
         if result.returncode == 3010:
             raise RebootRequired("WSL2 内核更新已安装，必须重启后才能继续。")
@@ -431,6 +662,9 @@ class InstallerApp:
             raise RuntimeError(
                 f"WSL2 内核安装失败（返回码 {result.returncode}）：{command_output(result)}"
             )
+        kernel = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "lxss" / "tools" / "kernel"
+        if not kernel.is_file():
+            raise RuntimeError(f"MSI 已返回成功，但未找到 WSL2 内核：{kernel}")
         self.log("✓ WSL2 Linux 内核更新已安装（或已存在更新版本）")
 
     def set_default_wsl2(self):
@@ -448,6 +682,9 @@ class InstallerApp:
                 result = run_command([str(launcher), "clean"], timeout=120, cwd=launcher.parent)
         if result.returncode != 0 or distro_registered():
             raise RuntimeError(f"注销现有 Alpine 失败：{command_output(result)}")
+        target = install_dir()
+        if target.exists():
+            shutil.rmtree(target)
         self.log("✓ 现有 Alpine 已注销")
 
     def install_alpine(self):
@@ -456,43 +693,36 @@ class InstallerApp:
         assets = bundle_dir()
         target = install_dir()
         target.mkdir(parents=True, exist_ok=True)
-        rootfs = assets / "rootfs.tar.gz"
+        launcher = target / "Alpine.exe"
+        shutil.copy2(assets / "Alpine.exe", launcher)
+        shutil.copy2(assets / "rootfs.tar.gz", target / "rootfs.tar.gz")
 
-        help_result = run_command(["wsl.exe", "--help"], timeout=30)
-        supports_import = "--import" in command_output(help_result)
-        if supports_import:
-            self.update_status("正在通过 wsl --import 安装 Alpine……")
+        self.update_status("正在通过 Alpine 启动器注册 WSL2 发行版……")
+        try:
             result = run_command(
-                [
-                    "wsl.exe",
-                    "--import",
-                    DISTRO_NAME,
-                    str(target),
-                    str(rootfs),
-                    "--version",
-                    "2",
-                ],
-                timeout=900,
+                [str(launcher), "install", "--root"], timeout=900, cwd=target
             )
-            if result.returncode != 0:
-                raise RuntimeError(f"Alpine 导入失败：{command_output(result)}")
+        except subprocess.TimeoutExpired:
+            if not distro_registered():
+                raise RuntimeError("Alpine 启动器超时，且未检测到发行版")
+            self.log("启动器未及时退出，但注册表已检测到 Alpine，继续独立验证。")
         else:
-            self.update_status("正在通过 Alpine 启动器注册发行版……")
-            launcher = target / "Alpine.exe"
-            shutil.copy2(assets / "Alpine.exe", launcher)
-            shutil.copy2(rootfs, target / "rootfs.tar.gz")
-            result = run_command([str(launcher)], timeout=900, cwd=target)
             if result.returncode != 0:
                 raise RuntimeError(f"Alpine 注册失败：{command_output(result)}")
+
+        registered = distro_info()
+        if not registered:
+            raise RuntimeError("安装命令已结束，但未检测到 Alpine 发行版")
+        if int(registered.get("Version", 0) or 0) != 2:
             self.log("正在将 Alpine 转换为 WSL2……")
             result = run_command(
                 ["wsl.exe", "--set-version", DISTRO_NAME, "2"], timeout=900
             )
-            if result.returncode != 0:
+            registered = distro_info()
+            if result.returncode != 0 and int(registered.get("Version", 0) or 0) != 2:
                 raise RuntimeError(f"转换 Alpine 为 WSL2 失败：{command_output(result)}")
-
-        if not distro_registered():
-            raise RuntimeError("安装命令已结束，但未检测到 Alpine 发行版")
+        if int(registered.get("Version", 0) or 0) != 2:
+            raise RuntimeError("Alpine 已注册，但无法确认其运行于 WSL2")
         self.log(f"✓ Alpine 已安装：{target}")
 
     def update_status(self, message: str):
@@ -500,7 +730,15 @@ class InstallerApp:
         self.log(message)
 
     def log(self, message: str):
-        timestamp = datetime.now().strftime("%H:%M:%S")
+        now = datetime.now()
+        timestamp = now.strftime("%H:%M:%S")
+        try:
+            log_dir = state_dir() / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            with (log_dir / "installer.log").open("a", encoding="utf-8") as stream:
+                stream.write(f"[{now.isoformat(timespec='seconds')}] {message}\n")
+        except OSError:
+            pass
         self.root.after(0, lambda: self._append(f"[{timestamp}] {message}\n"))
 
     def _append(self, text: str):
